@@ -31,6 +31,12 @@ set(QGIS_GUI_SRCS
   raster/qgsrastertransparencywidget.cpp
   raster/qgshillshaderendererwidget.cpp
   raster/qgsresamplingutils.cpp
+  raster/qgsrastertextureformats.cpp
+  raster/qgsrastergpucachemanager.cpp
+  raster/qgsrastergputileuploader.cpp
+  raster/qgsrastergpushaders.cpp
+  raster/qgsrastergpurenderer.cpp
+  raster/qgsrastergpufactory.cpp
 
   vector/qgsattributeactiondialog.cpp
   vector/qgsattributeactionpropertiesdialog.cpp
