@@ -16,8 +16,9 @@
 #ifndef QGSRASTERGPUFACTORY_H
 #define QGSRASTERGPUFACTORY_H
 
+#define SIP_NO_FILE
+
 #include "qgis_gui.h"
-#include "qgis_sip.h"
 
 /**
  * \ingroup gui
@@ -27,6 +28,11 @@
  * This class provides initialization for GPU raster rendering by registering
  * a factory function with the core rendering system. Call initialize() during
  * application startup to enable GPU rendering for compatible layers.
+ *
+ * \note This requires a valid OpenGL context and is intended for desktop QGIS only.
+ * QGIS Server and other headless environments should not call initialize() as no
+ * OpenGL context is available. In those cases, raster rendering falls back to
+ * the standard CPU path automatically.
  *
  * \since QGIS 3.40
  */

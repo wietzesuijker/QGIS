@@ -14,6 +14,8 @@
 #ifndef QGSRASTERGPUTILEUPLOADER_H
 #define QGSRASTERGPUTILEUPLOADER_H
 
+#define SIP_NO_FILE
+
 #include "qgis_gui.h"
 #include "qgsrastertextureformats.h"
 #include "qgsrastertilereader.h"
@@ -97,6 +99,27 @@ class GUI_EXPORT QgsRasterGPUTileUploader : protected QOpenGLFunctions
      * \returns GPU tile from cache or newly uploaded
      */
     GPUTile getTile( int overviewLevel, int tileX, int tileY, int bandNumber, quint64 frameNumber );
+
+    /**
+     * \brief Tile coordinate for batch operations
+     */
+    struct TileCoord
+    {
+        int level;
+        int x;
+        int y;
+    };
+
+    /**
+     * \brief Batch get multiple tiles (single mutex lock)
+     *
+     * More efficient than multiple getTile() calls when fetching many tiles.
+     * \param coords List of tile coordinates
+     * \param bandNumber Band number
+     * \param frameNumber Current frame number (for LRU)
+     * \returns Vector of GPU tiles (same order as coords)
+     */
+    QVector<GPUTile> getTiles( const QVector<TileCoord> &coords, int bandNumber, quint64 frameNumber );
 
     /**
      * \brief Get or create RGB GPU tile (with caching)

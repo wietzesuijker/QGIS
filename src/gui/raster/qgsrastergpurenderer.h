@@ -16,10 +16,11 @@
 #ifndef QGSRASTERGPURENDERER_H
 #define QGSRASTERGPURENDERER_H
 
+#define SIP_NO_FILE
+
 #include <memory>
 
 #include "qgis_gui.h"
-#include "qgis_sip.h"
 
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFunctions>
@@ -135,11 +136,6 @@ class GUI_EXPORT QgsRasterGPURenderer : protected QOpenGLFunctions
      * Select best overview level based on map scale
      */
     int selectOverviewLevel( const QgsRasterViewPort *viewport );
-
-    /**
-     * Render a single tile quad with texture
-     */
-    void renderTileQuad( GLuint textureId, const QgsRectangle &tileExtent, const QgsRenderContext &context );
 
     /**
      * Create shader program for current data type

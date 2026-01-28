@@ -160,47 +160,138 @@ bool QgsRasterGPURenderer::render( QgsRenderContext &renderContext, QgsRasterVie
   // Bind shader program
   mShaderProgram->bind();
 
-  // Render each tile
-  int tilesRendered = 0;
-  for ( const TileCoord &tileCoord : visibleTiles )
+  // Pre-fetch all GPU tiles using batch lookup (single mutex lock)
+  struct TileRenderData
   {
-    // Check for cancellation
-    if ( feedback && feedback->isCanceled() )
+      GLuint textureId;
+      QgsRectangle extent;
+  };
+  QVector<TileRenderData> tilesToRender;
+  tilesToRender.reserve( visibleTiles.size() );
+
+  if ( mRGBMode )
+  {
+    // RGB mode: fetch tiles individually (different band combinations)
+    for ( const TileCoord &tileCoord : visibleTiles )
     {
-      break;
+      if ( feedback && feedback->isCanceled() )
+        break;
+
+      auto gpuTile = mTileUploader->getRGBTile( tileCoord.level, tileCoord.x, tileCoord.y, mRedBand, mGreenBand, mBlueBand, mFrameNumber );
+      if ( !gpuTile.isValid )
+        continue;
+
+      const QgsRectangle tileExtent = mTileUploader->tileExtent( tileCoord.level, tileCoord.x, tileCoord.y );
+      if ( !tileExtent.isEmpty() )
+        tilesToRender.append( { gpuTile.textureId, tileExtent } );
+    }
+  }
+  else
+  {
+    // Single-band mode: use batch lookup (single mutex lock for all tiles)
+    QVector<QgsRasterGPUTileUploader::TileCoord> coords;
+    coords.reserve( visibleTiles.size() );
+    for ( const TileCoord &tc : visibleTiles )
+    {
+      coords.append( { tc.level, tc.x, tc.y } );
     }
 
-    // Upload tile to GPU (uses cache)
-    QgsRasterGPUTileUploader::GPUTile gpuTile;
-    if ( mRGBMode )
-    {
-      gpuTile = mTileUploader->getRGBTile( tileCoord.level, tileCoord.x, tileCoord.y, mRedBand, mGreenBand, mBlueBand, mFrameNumber );
-    }
-    else
-    {
-      const int bandNumber = 1;
-      gpuTile = mTileUploader->getTile( tileCoord.level, tileCoord.x, tileCoord.y, bandNumber, mFrameNumber );
-    }
+    const auto gpuTiles = mTileUploader->getTiles( coords, 1, mFrameNumber );
 
-    if ( !gpuTile.isValid )
+    for ( int i = 0; i < gpuTiles.size(); ++i )
     {
-      QgsDebugMsgLevel( u"Failed to upload tile %1/%2/%3"_s.arg( tileCoord.level ).arg( tileCoord.x ).arg( tileCoord.y ), 4 );
-      continue;
+      if ( feedback && feedback->isCanceled() )
+        break;
+
+      if ( !gpuTiles[i].isValid )
+        continue;
+
+      const QgsRectangle tileExtent = mTileUploader->tileExtent( visibleTiles[i].level, visibleTiles[i].x, visibleTiles[i].y );
+      if ( !tileExtent.isEmpty() )
+        tilesToRender.append( { gpuTiles[i].textureId, tileExtent } );
     }
+  }
 
-    // Calculate tile extent in map coordinates
-    const QgsRectangle tileExtent = mTileUploader->tileExtent( tileCoord.level, tileCoord.x, tileCoord.y );
-    if ( tileExtent.isEmpty() )
-    {
-      QgsDebugMsgLevel( u"Invalid tile extent for tile %1/%2/%3"_s.arg( tileCoord.level ).arg( tileCoord.x ).arg( tileCoord.y ), 4 );
-      continue;
-    }
+  if ( tilesToRender.isEmpty() )
+  {
+    mFBO->release();
+    return false;
+  }
 
-    // Render the tile quad
-    renderTileQuad( gpuTile.textureId, tileExtent, renderContext );
+  // Build batched vertex buffer for all tiles (6 vertices per tile, 4 floats per vertex)
+  constexpr int FLOATS_PER_VERTEX = 4; // x, y, u, v
+  constexpr int VERTICES_PER_TILE = 6;
+  QVector<float> batchedVertices;
+  batchedVertices.reserve( tilesToRender.size() * VERTICES_PER_TILE * FLOATS_PER_VERTEX );
 
+  for ( const TileRenderData &tile : tilesToRender )
+  {
+    const float x0 = tile.extent.xMinimum();
+    const float y0 = tile.extent.yMinimum();
+    const float x1 = tile.extent.xMaximum();
+    const float y1 = tile.extent.yMaximum();
+
+    // Triangle 1
+    batchedVertices << x0 << y0 << 0.0f << 1.0f;
+    batchedVertices << x1 << y0 << 1.0f << 1.0f;
+    batchedVertices << x1 << y1 << 1.0f << 0.0f;
+    // Triangle 2
+    batchedVertices << x0 << y0 << 0.0f << 1.0f;
+    batchedVertices << x1 << y1 << 1.0f << 0.0f;
+    batchedVertices << x0 << y1 << 0.0f << 0.0f;
+  }
+
+  // Upload batched vertex data once
+  if ( !mVBO )
+  {
+    glGenBuffers( 1, &mVBO );
+  }
+  glBindBuffer( GL_ARRAY_BUFFER, mVBO );
+  glBufferData( GL_ARRAY_BUFFER, batchedVertices.size() * sizeof( float ), batchedVertices.constData(), GL_DYNAMIC_DRAW );
+
+  // Setup vertex attributes (once for all tiles)
+  glVertexAttribPointer( 0, 2, GL_FLOAT, GL_FALSE, FLOATS_PER_VERTEX * sizeof( float ), ( void * ) 0 );
+  glEnableVertexAttribArray( 0 );
+  glVertexAttribPointer( 1, 2, GL_FLOAT, GL_FALSE, FLOATS_PER_VERTEX * sizeof( float ), ( void * ) ( 2 * sizeof( float ) ) );
+  glEnableVertexAttribArray( 1 );
+
+  // Build MVP matrix (shared for all tiles)
+  QMatrix4x4 mvpMatrix;
+  const QgsRectangle &viewExtent = renderContext.extent();
+  const float scaleX = 2.0f / viewExtent.width();
+  const float scaleY = 2.0f / viewExtent.height();
+  const float translateX = -( viewExtent.xMinimum() + viewExtent.xMaximum() ) / viewExtent.width();
+  const float translateY = -( viewExtent.yMinimum() + viewExtent.yMaximum() ) / viewExtent.height();
+  mvpMatrix.scale( scaleX, scaleY );
+  mvpMatrix.translate( translateX, translateY );
+  mShaderProgram->setUniformValue( "uMVPMatrix", mvpMatrix );
+
+  // Bind colormap texture once (single-band mode)
+  if ( !mRGBMode && mColormapTexture )
+  {
+    glActiveTexture( GL_TEXTURE1 );
+    glBindTexture( GL_TEXTURE_2D, mColormapTexture );
+    mShaderProgram->setUniformValue( "uColormapTexture", 1 );
+  }
+
+  // Render each tile (only texture binding changes per tile)
+  int tilesRendered = 0;
+  for ( int i = 0; i < tilesToRender.size(); ++i )
+  {
+    glActiveTexture( GL_TEXTURE0 );
+    glBindTexture( GL_TEXTURE_2D, tilesToRender[i].textureId );
+    mShaderProgram->setUniformValue( "uTileTexture", 0 );
+
+    // Draw 6 vertices (2 triangles) starting at this tile's offset
+    glDrawArrays( GL_TRIANGLES, i * VERTICES_PER_TILE, VERTICES_PER_TILE );
     tilesRendered++;
   }
+
+  // Cleanup vertex state
+  glDisableVertexAttribArray( 0 );
+  glDisableVertexAttribArray( 1 );
+  glBindBuffer( GL_ARRAY_BUFFER, 0 );
+  glBindTexture( GL_TEXTURE_2D, 0 );
 
   // Release shader
   mShaderProgram->release();
@@ -313,85 +404,6 @@ int QgsRasterGPURenderer::selectOverviewLevel( const QgsRasterViewPort *viewport
 
   // Get best overview from tile uploader
   return mTileUploader->selectBestOverview( mapMupp );
-}
-
-void QgsRasterGPURenderer::renderTileQuad( GLuint textureId, const QgsRectangle &tileExtent, const QgsRenderContext &context )
-{
-  // Bind tile texture to unit 0
-  glActiveTexture( GL_TEXTURE0 );
-  glBindTexture( GL_TEXTURE_2D, textureId );
-  mShaderProgram->setUniformValue( "uTileTexture", 0 );
-
-  // Bind colormap texture to unit 1 (single-band mode only)
-  if ( !mRGBMode && mColormapTexture )
-  {
-    glActiveTexture( GL_TEXTURE1 );
-    glBindTexture( GL_TEXTURE_2D, mColormapTexture );
-    mShaderProgram->setUniformValue( "uColormapTexture", 1 );
-  }
-
-  // Build MVP matrix (map extent → screen coordinates)
-  // Transform from tile's map coordinates to normalized device coordinates [-1, 1]
-  QMatrix4x4 mvpMatrix;
-
-  const QgsRectangle &viewExtent = context.extent();
-
-  // Scale: map units → normalized device coordinates
-  const float scaleX = 2.0f / viewExtent.width();
-  const float scaleY = 2.0f / viewExtent.height();
-
-  // Translate: center map extent at origin
-  const float translateX = -( viewExtent.xMinimum() + viewExtent.xMaximum() ) / viewExtent.width();
-  const float translateY = -( viewExtent.yMinimum() + viewExtent.yMaximum() ) / viewExtent.height();
-
-  mvpMatrix.scale( scaleX, scaleY );
-  mvpMatrix.translate( translateX, translateY );
-
-  mShaderProgram->setUniformValue( "uMVPMatrix", mvpMatrix );
-
-  // Define tile quad vertices (in map coordinates)
-  const float x0 = tileExtent.xMinimum();
-  const float y0 = tileExtent.yMinimum();
-  const float x1 = tileExtent.xMaximum();
-  const float y1 = tileExtent.yMaximum();
-
-  // Vertex data: position (x, y) + texcoord (u, v)
-  const float vertices[] = {
-    // Triangle 1
-    x0, y0, 0.0f, 1.0f, // bottom-left
-    x1, y0, 1.0f, 1.0f, // bottom-right
-    x1, y1, 1.0f, 0.0f, // top-right
-
-    // Triangle 2
-    x0, y0, 0.0f, 1.0f, // bottom-left
-    x1, y1, 1.0f, 0.0f, // top-right
-    x0, y1, 0.0f, 0.0f, // top-left
-  };
-
-  // Upload vertex data
-  if ( !mVBO )
-  {
-    glGenBuffers( 1, &mVBO );
-  }
-
-  glBindBuffer( GL_ARRAY_BUFFER, mVBO );
-  glBufferData( GL_ARRAY_BUFFER, sizeof( vertices ), vertices, GL_DYNAMIC_DRAW );
-
-  // Setup vertex attributes
-  glVertexAttribPointer( 0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof( float ), ( void * ) 0 );
-  glEnableVertexAttribArray( 0 );
-
-  glVertexAttribPointer( 1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof( float ), ( void * ) ( 2 * sizeof( float ) ) );
-  glEnableVertexAttribArray( 1 );
-
-  // Draw tile quad
-  glDrawArrays( GL_TRIANGLES, 0, 6 );
-
-  // Cleanup
-  glDisableVertexAttribArray( 0 );
-  glDisableVertexAttribArray( 1 );
-  glBindBuffer( GL_ARRAY_BUFFER, 0 );
-  glBindTexture( GL_TEXTURE_2D, 0 );
 }
 
 bool QgsRasterGPURenderer::createShaderProgram()

@@ -16,6 +16,8 @@
 #ifndef QGSRASTERGPUCACHEMANAGER_H
 #define QGSRASTERGPUCACHEMANAGER_H
 
+#define SIP_NO_FILE
+
 #include <memory>
 #include <unordered_map>
 

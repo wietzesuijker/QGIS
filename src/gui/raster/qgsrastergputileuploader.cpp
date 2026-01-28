@@ -162,6 +162,41 @@ QgsRasterGPUTileUploader::GPUTile QgsRasterGPUTileUploader::getTile(
   return tile;
 }
 
+QVector<QgsRasterGPUTileUploader::GPUTile> QgsRasterGPUTileUploader::getTiles(
+  const QVector<TileCoord> &coords, int bandNumber, quint64 frameNumber
+)
+{
+  QMutexLocker locker( &mMutex );
+
+  QVector<GPUTile> results;
+  results.reserve( coords.size() );
+
+  for ( const TileCoord &coord : coords )
+  {
+    const quint64 key = makeTileKey( coord.level, coord.x, coord.y, bandNumber );
+
+    // Check cache first
+    if ( mTileCache.contains( key ) )
+    {
+      GPUTile &tile = mTileCache[key];
+      tile.lastUsedFrame = frameNumber;
+      results.append( tile );
+      continue;
+    }
+
+    // Upload new tile (still under same lock - avoids re-acquiring)
+    GPUTile tile = uploadTile( coord.level, coord.x, coord.y, bandNumber );
+    if ( tile.isValid )
+    {
+      tile.lastUsedFrame = frameNumber;
+      mTileCache[key] = tile;
+    }
+    results.append( tile );
+  }
+
+  return results;
+}
+
 QgsRasterGPUTileUploader::GPUTile QgsRasterGPUTileUploader::uploadRGBTile(
   int overviewLevel, int tileX, int tileY, int redBand, int greenBand, int blueBand
 )

@@ -14,6 +14,8 @@
 #ifndef QGSRASTERTEXTUREFORMATS_H
 #define QGSRASTERTEXTUREFORMATS_H
 
+#define SIP_NO_FILE
+
 #include "qgis.h"
 #include "qgis_gui.h"
 
