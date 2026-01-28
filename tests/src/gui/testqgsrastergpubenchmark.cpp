@@ -11,18 +11,26 @@
  *                                                                         *
  ***************************************************************************/
 
-#include "qgstest.h"
+#include <algorithm>
+#include <cmath>
+
 #include "qgsapplication.h"
-#include "qgsrasterlayer.h"
-#include "qgsmapsettings.h"
 #include "qgsmaprenderersequentialjob.h"
+#include "qgsmapsettings.h"
 #include "qgsproject.h"
 #include "qgsrastergpufactory.h"
+#include "qgsrasterlayer.h"
+#include "qgstest.h"
 
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
+#include <QOpenGLFunctions>
 
 /**
  * \ingroup UnitTests
@@ -39,30 +47,46 @@ class TestQgsRasterGPUBenchmark : public QgsTest
     Q_OBJECT
 
   public:
-    TestQgsRasterGPUBenchmark() : QgsTest( QStringLiteral( "GPU Raster Benchmark Tests" ) ) {}
+    TestQgsRasterGPUBenchmark()
+      : QgsTest( u"GPU Raster Benchmark Tests"_s ) {}
 
   private slots:
     void initTestCase();
     void cleanupTestCase();
 
     // Scenario-based benchmarks (more representative of real usage)
-    void benchmarkInitialRender();      // Opening a COG layer
-    void benchmarkPanSimulation();      // User panning across map
-    void benchmarkZoomSimulation();     // User zooming in/out
-    void benchmarkCacheEfficiency();    // Returning to previous view
+    void benchmarkInitialRender();   // Opening a COG layer
+    void benchmarkPanSimulation();   // User panning across map
+    void benchmarkZoomSimulation();  // User zooming in/out
+    void benchmarkCacheEfficiency(); // Returning to previous view
+
+    // Data type matrix (tests different data types)
+    void benchmarkFloat32(); // Float32 continuous data
 
     void benchmarkComparison();
 
   private:
+    struct HardwareInfo
+    {
+        QString renderer;
+        QString version;
+        QString vendor;
+        QString glslVersion;
+    };
+
     struct BenchmarkResult
     {
         QString scenario;
         QString mode;
+        QString dataType;
         int tiles;
         double avgMs;
         double minMs;
         double maxMs;
-        double fps;  // frames per second for pan/zoom scenarios
+        double medianMs;
+        double stddevMs;
+        double fps;               // frames per second for pan/zoom scenarios
+        QVector<double> allTimes; // raw measurements for stats
     };
 
     // Single render measurement
@@ -80,10 +104,16 @@ class TestQgsRasterGPUBenchmark : public QgsTest
 
     bool createGLContext();
     void destroyGLContext();
+    HardwareInfo getHardwareInfo();
+    void computeStatistics( BenchmarkResult &result );
+    QJsonObject resultToJson( const BenchmarkResult &result );
+    void writeJsonOutput();
 
     QOpenGLContext *mGLContext = nullptr;
+    HardwareInfo mHardwareInfo;
     QOffscreenSurface *mSurface = nullptr;
-    QString mCogPath;
+    QString mCogPath;        // Byte COG (NLCD)
+    QString mFloat32CogPath; // Float32 COG (synthetic)
 
     // Store results for comparison
     QVector<BenchmarkResult> mCpuResults;
@@ -96,13 +126,23 @@ void TestQgsRasterGPUBenchmark::initTestCase()
   QgsApplication::initQgis();
 
   // Use local COG if available, otherwise remote
-  mCogPath = QStringLiteral( "/tmp/qgis-bench-cog.tif" );
+  mCogPath = u"/tmp/qgis-bench-cog.tif"_s;
   if ( !QFile::exists( mCogPath ) )
   {
-    mCogPath = QStringLiteral( "/vsicurl/https://s3.us-east-1.amazonaws.com/ds-deck.gl-raster-public/cog/Annual_NLCD_LndCov_2024_CU_C1V1.tif" );
+    mCogPath = u"/vsicurl/https://s3.us-east-1.amazonaws.com/ds-deck.gl-raster-public/cog/Annual_NLCD_LndCov_2024_CU_C1V1.tif"_s;
   }
 
-  qDebug() << "Using COG:" << mCogPath;
+  // Float32 COG for data type matrix testing
+  mFloat32CogPath = u"/tmp/qgis-bench-float32.tif"_s;
+  if ( !QFile::exists( mFloat32CogPath ) )
+  {
+    qDebug() << "Float32 COG not found - skipping Float32 benchmarks";
+    mFloat32CogPath.clear();
+  }
+
+  qDebug() << "Using Byte COG:" << mCogPath;
+  if ( !mFloat32CogPath.isEmpty() )
+    qDebug() << "Using Float32 COG:" << mFloat32CogPath;
 }
 
 void TestQgsRasterGPUBenchmark::cleanupTestCase()
@@ -152,6 +192,119 @@ void TestQgsRasterGPUBenchmark::destroyGLContext()
   }
   delete mSurface;
   mSurface = nullptr;
+}
+
+TestQgsRasterGPUBenchmark::HardwareInfo TestQgsRasterGPUBenchmark::getHardwareInfo()
+{
+  HardwareInfo info;
+  if ( mGLContext && mGLContext->isValid() )
+  {
+    QOpenGLFunctions *f = mGLContext->functions();
+    if ( f )
+    {
+      info.renderer = QString::fromLatin1( reinterpret_cast<const char *>( f->glGetString( GL_RENDERER ) ) );
+      info.version = QString::fromLatin1( reinterpret_cast<const char *>( f->glGetString( GL_VERSION ) ) );
+      info.vendor = QString::fromLatin1( reinterpret_cast<const char *>( f->glGetString( GL_VENDOR ) ) );
+      info.glslVersion = QString::fromLatin1( reinterpret_cast<const char *>( f->glGetString( GL_SHADING_LANGUAGE_VERSION ) ) );
+    }
+  }
+  return info;
+}
+
+void TestQgsRasterGPUBenchmark::computeStatistics( BenchmarkResult &result )
+{
+  if ( result.allTimes.isEmpty() )
+    return;
+
+  // Sort for median
+  QVector<double> sorted = result.allTimes;
+  std::sort( sorted.begin(), sorted.end() );
+
+  // Median
+  const int n = sorted.size();
+  if ( n % 2 == 0 )
+    result.medianMs = ( sorted[n / 2 - 1] + sorted[n / 2] ) / 2.0;
+  else
+    result.medianMs = sorted[n / 2];
+
+  // Mean (already computed as avgMs)
+  double sum = 0;
+  for ( double t : result.allTimes )
+    sum += t;
+  result.avgMs = sum / n;
+
+  // Standard deviation
+  double sumSq = 0;
+  for ( double t : result.allTimes )
+  {
+    const double diff = t - result.avgMs;
+    sumSq += diff * diff;
+  }
+  result.stddevMs = std::sqrt( sumSq / n );
+}
+
+QJsonObject TestQgsRasterGPUBenchmark::resultToJson( const BenchmarkResult &result )
+{
+  QJsonObject obj;
+  obj[u"scenario"_s] = result.scenario;
+  obj[u"mode"_s] = result.mode;
+  obj[u"data_type"_s] = result.dataType;
+  obj[u"tiles"_s] = result.tiles;
+  obj[u"avg_ms"_s] = result.avgMs;
+  obj[u"min_ms"_s] = result.minMs;
+  obj[u"max_ms"_s] = result.maxMs;
+  obj[u"median_ms"_s] = result.medianMs;
+  obj[u"stddev_ms"_s] = result.stddevMs;
+  obj[u"fps"_s] = result.fps;
+  return obj;
+}
+
+void TestQgsRasterGPUBenchmark::writeJsonOutput()
+{
+  QJsonObject root;
+
+  // Metadata
+  root[u"timestamp"_s] = QDateTime::currentDateTimeUtc().toString( Qt::ISODate );
+  root[u"qgis_version"_s] = Qgis::version();
+
+  // Hardware info
+  QJsonObject hw;
+  hw[u"renderer"_s] = mHardwareInfo.renderer;
+  hw[u"version"_s] = mHardwareInfo.version;
+  hw[u"vendor"_s] = mHardwareInfo.vendor;
+  hw[u"glsl_version"_s] = mHardwareInfo.glslVersion;
+  root[u"hardware"_s] = hw;
+
+  // CPU results
+  QJsonArray cpuArray;
+  for ( const auto &r : mCpuResults )
+    cpuArray.append( resultToJson( r ) );
+  root[u"cpu_results"_s] = cpuArray;
+
+  // GPU results
+  QJsonArray gpuArray;
+  for ( const auto &r : mGpuResults )
+    gpuArray.append( resultToJson( r ) );
+  root[u"gpu_results"_s] = gpuArray;
+
+  // Speedup summary
+  QJsonArray speedups;
+  for ( int i = 0; i < mCpuResults.size() && i < mGpuResults.size(); ++i )
+  {
+    QJsonObject sp;
+    sp[u"scenario"_s] = mCpuResults[i].scenario;
+    const double speedup = ( mGpuResults[i].avgMs > 0 ) ? mCpuResults[i].avgMs / mGpuResults[i].avgMs : 0;
+    sp[u"speedup"_s] = speedup;
+    speedups.append( sp );
+  }
+  root[u"speedups"_s] = speedups;
+
+  // Write JSON
+  QJsonDocument doc( root );
+  qDebug() << "";
+  qDebug() << "BENCHMARK_JSON_START";
+  qDebug().noquote() << doc.toJson( QJsonDocument::Indented );
+  qDebug() << "BENCHMARK_JSON_END";
 }
 
 QgsRectangle TestQgsRasterGPUBenchmark::getExtentForTiles( QgsRasterLayer *layer, int targetTiles )
@@ -226,11 +379,16 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runInitial
 {
   // Simulates: User opens QGIS project with a COG layer (cold cache)
   BenchmarkResult result;
-  result.scenario = QStringLiteral( "Initial Load" );
-  result.mode = useGPU ? QStringLiteral( "GPU" ) : QStringLiteral( "CPU" );
+  result.scenario = u"Initial Load"_s;
+  result.mode = useGPU ? u"GPU"_s : u"CPU"_s;
+  result.dataType = layer->dataProvider()->dataType( 1 ) == Qgis::DataType::Float32
+                      ? u"Float32"_s
+                      : u"Byte"_s;
   result.minMs = std::numeric_limits<double>::max();
   result.maxMs = 0;
   result.fps = 0;
+  result.medianMs = 0;
+  result.stddevMs = 0;
 
   const QgsRectangle extent = getExtentForTiles( layer, targetTiles );
   result.tiles = estimateTiles( layer, extent );
@@ -238,24 +396,19 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runInitial
   QgsMapSettings settings;
   settings.setLayers( { layer } );
   settings.setExtent( extent );
-  settings.setOutputSize( QSize( 1024, 1024 ) );  // Typical canvas size
+  settings.setOutputSize( QSize( 1024, 1024 ) ); // Typical canvas size
   settings.setDestinationCrs( layer->crs() );
 
   // Measure 5 cold renders (no warmup - that's the point)
-  QVector<double> times;
   for ( int i = 0; i < 5; ++i )
   {
     const double elapsed = measureRenderTime( settings );
-    times.append( elapsed );
+    result.allTimes.append( elapsed );
     result.minMs = std::min( result.minMs, elapsed );
     result.maxMs = std::max( result.maxMs, elapsed );
   }
 
-  double sum = 0;
-  for ( double t : times )
-    sum += t;
-  result.avgMs = sum / times.size();
-
+  computeStatistics( result );
   return result;
 }
 
@@ -266,11 +419,16 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runPanSimu
   // Simulates: User panning across the map (incremental tile loads)
   // Each pan shifts by 25% of view - some tiles reused, some new
   BenchmarkResult result;
-  result.scenario = QStringLiteral( "Pan (%1 steps)" ).arg( steps );
-  result.mode = useGPU ? QStringLiteral( "GPU" ) : QStringLiteral( "CPU" );
+  result.scenario = u"Pan (%1 steps)"_s.arg( steps );
+  result.mode = useGPU ? u"GPU"_s : u"CPU"_s;
+  result.dataType = layer->dataProvider()->dataType( 1 ) == Qgis::DataType::Float32
+                      ? u"Float32"_s
+                      : u"Byte"_s;
   result.tiles = 0;
   result.minMs = std::numeric_limits<double>::max();
   result.maxMs = 0;
+  result.medianMs = 0;
+  result.stddevMs = 0;
 
   // Start with ~100 tiles visible
   QgsRectangle extent = getExtentForTiles( layer, 100 );
@@ -281,20 +439,21 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runPanSimu
   settings.setOutputSize( QSize( 1024, 1024 ) );
   settings.setDestinationCrs( layer->crs() );
 
-  // Warmup
+  // Warmup (2 renders to stabilize)
   settings.setExtent( extent );
+  measureRenderTime( settings );
   measureRenderTime( settings );
 
   // Pan in a pattern: right, right, down, left, left, down, ...
-  const double panFraction = 0.25;  // 25% overlap between frames
+  const double panFraction = 0.25; // 25% overlap between frames
   const QVector<QPair<double, double>> directions = {
-    { panFraction, 0 }, { panFraction, 0 },   // right, right
-    { 0, -panFraction },                       // down
-    { -panFraction, 0 }, { -panFraction, 0 }, // left, left
-    { 0, -panFraction }                        // down
+    { panFraction, 0 }, { panFraction, 0 }, // right, right
+    { 0, -panFraction },                    // down
+    { -panFraction, 0 },
+    { -panFraction, 0 }, // left, left
+    { 0, -panFraction }  // down
   };
 
-  QVector<double> times;
   for ( int i = 0; i < steps; ++i )
   {
     const auto &dir = directions[i % directions.size()];
@@ -302,16 +461,13 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runPanSimu
     settings.setExtent( extent );
 
     const double elapsed = measureRenderTime( settings );
-    times.append( elapsed );
+    result.allTimes.append( elapsed );
     result.minMs = std::min( result.minMs, elapsed );
     result.maxMs = std::max( result.maxMs, elapsed );
   }
 
-  double sum = 0;
-  for ( double t : times )
-    sum += t;
-  result.avgMs = sum / times.size();
-  result.fps = 1000.0 / result.avgMs;  // Convert ms to FPS
+  computeStatistics( result );
+  result.fps = 1000.0 / result.avgMs; // Convert ms to FPS
 
   return result;
 }
@@ -322,11 +478,16 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runZoomSim
 {
   // Simulates: User zooming in (triggers different overview levels)
   BenchmarkResult result;
-  result.scenario = QStringLiteral( "Zoom (%1 levels)" ).arg( levels );
-  result.mode = useGPU ? QStringLiteral( "GPU" ) : QStringLiteral( "CPU" );
+  result.scenario = u"Zoom (%1 levels)"_s.arg( levels );
+  result.mode = useGPU ? u"GPU"_s : u"CPU"_s;
+  result.dataType = layer->dataProvider()->dataType( 1 ) == Qgis::DataType::Float32
+                      ? u"Float32"_s
+                      : u"Byte"_s;
   result.tiles = 0;
   result.minMs = std::numeric_limits<double>::max();
   result.maxMs = 0;
+  result.medianMs = 0;
+  result.stddevMs = 0;
 
   // Start zoomed out (full extent)
   QgsRectangle extent = layer->extent();
@@ -336,14 +497,13 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runZoomSim
   settings.setOutputSize( QSize( 1024, 1024 ) );
   settings.setDestinationCrs( layer->crs() );
 
-  QVector<double> times;
   for ( int i = 0; i < levels; ++i )
   {
     settings.setExtent( extent );
     result.tiles = std::max( result.tiles, estimateTiles( layer, extent ) );
 
     const double elapsed = measureRenderTime( settings );
-    times.append( elapsed );
+    result.allTimes.append( elapsed );
     result.minMs = std::min( result.minMs, elapsed );
     result.maxMs = std::max( result.maxMs, elapsed );
 
@@ -357,10 +517,7 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runZoomSim
     );
   }
 
-  double sum = 0;
-  for ( double t : times )
-    sum += t;
-  result.avgMs = sum / times.size();
+  computeStatistics( result );
   result.fps = 1000.0 / result.avgMs;
 
   return result;
@@ -372,10 +529,15 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runCacheTe
 {
   // Simulates: User returns to previous view (warm cache)
   BenchmarkResult result;
-  result.scenario = QStringLiteral( "Cache Hit" );
-  result.mode = useGPU ? QStringLiteral( "GPU" ) : QStringLiteral( "CPU" );
+  result.scenario = u"Cache Hit"_s;
+  result.mode = useGPU ? u"GPU"_s : u"CPU"_s;
+  result.dataType = layer->dataProvider()->dataType( 1 ) == Qgis::DataType::Float32
+                      ? u"Float32"_s
+                      : u"Byte"_s;
   result.minMs = std::numeric_limits<double>::max();
   result.maxMs = 0;
+  result.medianMs = 0;
+  result.stddevMs = 0;
 
   const QgsRectangle extent = getExtentForTiles( layer, targetTiles );
   result.tiles = estimateTiles( layer, extent );
@@ -390,19 +552,15 @@ TestQgsRasterGPUBenchmark::BenchmarkResult TestQgsRasterGPUBenchmark::runCacheTe
   measureRenderTime( settings );
 
   // Measure repeated renders of same extent (should hit cache)
-  QVector<double> times;
   for ( int i = 0; i < 10; ++i )
   {
     const double elapsed = measureRenderTime( settings );
-    times.append( elapsed );
+    result.allTimes.append( elapsed );
     result.minMs = std::min( result.minMs, elapsed );
     result.maxMs = std::max( result.maxMs, elapsed );
   }
 
-  double sum = 0;
-  for ( double t : times )
-    sum += t;
-  result.avgMs = sum / times.size();
+  computeStatistics( result );
   result.fps = 1000.0 / result.avgMs;
 
   return result;
@@ -417,7 +575,7 @@ void TestQgsRasterGPUBenchmark::benchmarkInitialRender()
   qDebug() << "Simulates opening a project with a COG layer";
   qDebug() << "";
 
-  QgsRasterLayer layer( mCogPath, QStringLiteral( "benchmark" ), QStringLiteral( "gdal" ) );
+  QgsRasterLayer layer( mCogPath, u"benchmark"_s, u"gdal"_s );
   if ( !layer.isValid() )
   {
     QSKIP( "Could not load test COG" );
@@ -428,20 +586,30 @@ void TestQgsRasterGPUBenchmark::benchmarkInitialRender()
   mCpuResults.append( cpuResult );
 
   qDebug() << QString( "CPU: %1 ms avg (%2 tiles)" )
-    .arg( cpuResult.avgMs, 0, 'f', 1 )
-    .arg( cpuResult.tiles );
+                .arg( cpuResult.avgMs, 0, 'f', 1 )
+                .arg( cpuResult.tiles );
 
   // GPU test
   if ( createGLContext() )
   {
+    // Capture hardware info on first GL context creation
+    if ( mHardwareInfo.renderer.isEmpty() )
+    {
+      mHardwareInfo = getHardwareInfo();
+      qDebug() << "Hardware:" << mHardwareInfo.renderer;
+      qDebug() << "OpenGL:" << mHardwareInfo.version;
+    }
+
     QgsRasterGPUFactory::initialize();
     auto gpuResult = runInitialRender( &layer, 100, true );
     mGpuResults.append( gpuResult );
 
     const double speedup = cpuResult.avgMs / gpuResult.avgMs;
-    qDebug() << QString( "GPU: %1 ms avg → %2x speedup" )
-      .arg( gpuResult.avgMs, 0, 'f', 1 )
-      .arg( speedup, 0, 'f', 1 );
+    qDebug() << QString( "GPU: %1 ms avg (median %2, stddev %3) → %4x speedup" )
+                  .arg( gpuResult.avgMs, 0, 'f', 1 )
+                  .arg( gpuResult.medianMs, 0, 'f', 1 )
+                  .arg( gpuResult.stddevMs, 0, 'f', 1 )
+                  .arg( speedup, 0, 'f', 1 );
   }
   else
   {
@@ -461,21 +629,21 @@ void TestQgsRasterGPUBenchmark::benchmarkPanSimulation()
   qDebug() << "(25% overlap between frames = partial tile reuse)";
   qDebug() << "";
 
-  QgsRasterLayer layer( mCogPath, QStringLiteral( "benchmark" ), QStringLiteral( "gdal" ) );
+  QgsRasterLayer layer( mCogPath, u"benchmark"_s, u"gdal"_s );
   if ( !layer.isValid() )
   {
     QSKIP( "Could not load test COG" );
   }
 
-  const int panSteps = 12;  // ~2 seconds of panning at 60fps target
+  const int panSteps = 12; // ~2 seconds of panning at 60fps target
 
   // CPU baseline
   auto cpuResult = runPanSimulation( &layer, panSteps, false );
   mCpuResults.append( cpuResult );
 
   qDebug() << QString( "CPU: %1 ms/frame → %2 FPS" )
-    .arg( cpuResult.avgMs, 0, 'f', 1 )
-    .arg( cpuResult.fps, 0, 'f', 1 );
+                .arg( cpuResult.avgMs, 0, 'f', 1 )
+                .arg( cpuResult.fps, 0, 'f', 1 );
 
   // GPU test
   if ( createGLContext() )
@@ -485,9 +653,9 @@ void TestQgsRasterGPUBenchmark::benchmarkPanSimulation()
     mGpuResults.append( gpuResult );
 
     qDebug() << QString( "GPU: %1 ms/frame → %2 FPS (%3x speedup)" )
-      .arg( gpuResult.avgMs, 0, 'f', 1 )
-      .arg( gpuResult.fps, 0, 'f', 1 )
-      .arg( cpuResult.avgMs / gpuResult.avgMs, 0, 'f', 1 );
+                  .arg( gpuResult.avgMs, 0, 'f', 1 )
+                  .arg( gpuResult.fps, 0, 'f', 1 )
+                  .arg( cpuResult.avgMs / gpuResult.avgMs, 0, 'f', 1 );
   }
   else
   {
@@ -507,21 +675,21 @@ void TestQgsRasterGPUBenchmark::benchmarkZoomSimulation()
   qDebug() << "(Tests overview pyramid traversal)";
   qDebug() << "";
 
-  QgsRasterLayer layer( mCogPath, QStringLiteral( "benchmark" ), QStringLiteral( "gdal" ) );
+  QgsRasterLayer layer( mCogPath, u"benchmark"_s, u"gdal"_s );
   if ( !layer.isValid() )
   {
     QSKIP( "Could not load test COG" );
   }
 
-  const int zoomLevels = 6;  // Full extent down to ~64x zoom
+  const int zoomLevels = 6; // Full extent down to ~64x zoom
 
   // CPU baseline
   auto cpuResult = runZoomSimulation( &layer, zoomLevels, false );
   mCpuResults.append( cpuResult );
 
   qDebug() << QString( "CPU: %1 ms/level avg (max %2 tiles)" )
-    .arg( cpuResult.avgMs, 0, 'f', 1 )
-    .arg( cpuResult.tiles );
+                .arg( cpuResult.avgMs, 0, 'f', 1 )
+                .arg( cpuResult.tiles );
 
   // GPU test
   if ( createGLContext() )
@@ -531,8 +699,8 @@ void TestQgsRasterGPUBenchmark::benchmarkZoomSimulation()
     mGpuResults.append( gpuResult );
 
     qDebug() << QString( "GPU: %1 ms/level → %2x speedup" )
-      .arg( gpuResult.avgMs, 0, 'f', 1 )
-      .arg( cpuResult.avgMs / gpuResult.avgMs, 0, 'f', 1 );
+                  .arg( gpuResult.avgMs, 0, 'f', 1 )
+                  .arg( cpuResult.avgMs / gpuResult.avgMs, 0, 'f', 1 );
   }
   else
   {
@@ -552,7 +720,7 @@ void TestQgsRasterGPUBenchmark::benchmarkCacheEfficiency()
   qDebug() << "(All tiles should be cached)";
   qDebug() << "";
 
-  QgsRasterLayer layer( mCogPath, QStringLiteral( "benchmark" ), QStringLiteral( "gdal" ) );
+  QgsRasterLayer layer( mCogPath, u"benchmark"_s, u"gdal"_s );
   if ( !layer.isValid() )
   {
     QSKIP( "Could not load test COG" );
@@ -563,8 +731,8 @@ void TestQgsRasterGPUBenchmark::benchmarkCacheEfficiency()
   mCpuResults.append( cpuResult );
 
   qDebug() << QString( "CPU: %1 ms/frame → %2 FPS (warm cache)" )
-    .arg( cpuResult.avgMs, 0, 'f', 1 )
-    .arg( cpuResult.fps, 0, 'f', 1 );
+                .arg( cpuResult.avgMs, 0, 'f', 1 )
+                .arg( cpuResult.fps, 0, 'f', 1 );
 
   // GPU test
   if ( createGLContext() )
@@ -574,9 +742,9 @@ void TestQgsRasterGPUBenchmark::benchmarkCacheEfficiency()
     mGpuResults.append( gpuResult );
 
     qDebug() << QString( "GPU: %1 ms/frame → %2 FPS (%3x speedup)" )
-      .arg( gpuResult.avgMs, 0, 'f', 1 )
-      .arg( gpuResult.fps, 0, 'f', 1 )
-      .arg( cpuResult.avgMs / gpuResult.avgMs, 0, 'f', 1 );
+                  .arg( gpuResult.avgMs, 0, 'f', 1 )
+                  .arg( gpuResult.fps, 0, 'f', 1 )
+                  .arg( cpuResult.avgMs / gpuResult.avgMs, 0, 'f', 1 );
   }
   else
   {
@@ -587,6 +755,103 @@ void TestQgsRasterGPUBenchmark::benchmarkCacheEfficiency()
   if ( mGLContext )
   {
     QgsRasterGPUFactory::cleanup();
+  }
+
+  QVERIFY( true );
+}
+
+void TestQgsRasterGPUBenchmark::benchmarkFloat32()
+{
+  // Data type matrix: Float32 continuous data (like DEMs, scientific data)
+  qDebug() << "\n========================================";
+  qDebug() << "Data Type: Float32 (Continuous)";
+  qDebug() << "========================================";
+  qDebug() << "Tests GPU handling of 32-bit floating point rasters";
+  qDebug() << "(DEMs, scientific data, elevation models)";
+  qDebug() << "";
+
+  if ( mFloat32CogPath.isEmpty() )
+  {
+    QSKIP( "Float32 test COG not available" );
+  }
+
+  QgsRasterLayer layer( mFloat32CogPath, u"float32_benchmark"_s, u"gdal"_s );
+  if ( !layer.isValid() )
+  {
+    QSKIP( "Could not load Float32 test COG" );
+  }
+
+  qDebug() << "Data type:" << layer.dataProvider()->dataType( 1 );
+
+  // --- Float32 Initial Load ---
+  qDebug() << "\n-- Float32 Initial Load --";
+  auto cpuLoad = runInitialRender( &layer, 16, false );
+  cpuLoad.scenario = u"Float32 Load"_s;
+  mCpuResults.append( cpuLoad );
+
+  qDebug() << QString( "CPU: %1 ms avg (%2 tiles)" )
+                .arg( cpuLoad.avgMs, 0, 'f', 1 )
+                .arg( cpuLoad.tiles );
+
+  if ( createGLContext() )
+  {
+    QgsRasterGPUFactory::initialize();
+    auto gpuLoad = runInitialRender( &layer, 16, true );
+    gpuLoad.scenario = u"Float32 Load"_s;
+    mGpuResults.append( gpuLoad );
+
+    qDebug() << QString( "GPU: %1 ms avg → %2x speedup" )
+                  .arg( gpuLoad.avgMs, 0, 'f', 1 )
+                  .arg( cpuLoad.avgMs / gpuLoad.avgMs, 0, 'f', 1 );
+  }
+
+  // --- Float32 Pan ---
+  qDebug() << "\n-- Float32 Pan --";
+  const int panSteps = 8;
+  auto cpuPan = runPanSimulation( &layer, panSteps, false );
+  cpuPan.scenario = u"Float32 Pan"_s;
+  mCpuResults.append( cpuPan );
+
+  qDebug() << QString( "CPU: %1 ms/frame → %2 FPS" )
+                .arg( cpuPan.avgMs, 0, 'f', 1 )
+                .arg( cpuPan.fps, 0, 'f', 1 );
+
+  if ( mGLContext )
+  {
+    auto gpuPan = runPanSimulation( &layer, panSteps, true );
+    gpuPan.scenario = u"Float32 Pan"_s;
+    mGpuResults.append( gpuPan );
+
+    qDebug() << QString( "GPU: %1 ms/frame → %2 FPS (%3x speedup)" )
+                  .arg( gpuPan.avgMs, 0, 'f', 1 )
+                  .arg( gpuPan.fps, 0, 'f', 1 )
+                  .arg( cpuPan.avgMs / gpuPan.avgMs, 0, 'f', 1 );
+  }
+
+  // --- Float32 Zoom ---
+  qDebug() << "\n-- Float32 Zoom --";
+  const int zoomLevels = 4;
+  auto cpuZoom = runZoomSimulation( &layer, zoomLevels, false );
+  cpuZoom.scenario = u"Float32 Zoom"_s;
+  mCpuResults.append( cpuZoom );
+
+  qDebug() << QString( "CPU: %1 ms/level avg" )
+                .arg( cpuZoom.avgMs, 0, 'f', 1 );
+
+  if ( mGLContext )
+  {
+    auto gpuZoom = runZoomSimulation( &layer, zoomLevels, true );
+    gpuZoom.scenario = u"Float32 Zoom"_s;
+    mGpuResults.append( gpuZoom );
+
+    qDebug() << QString( "GPU: %1 ms/level → %2x speedup" )
+                  .arg( gpuZoom.avgMs, 0, 'f', 1 )
+                  .arg( cpuZoom.avgMs / gpuZoom.avgMs, 0, 'f', 1 );
+  }
+
+  if ( !mGLContext )
+  {
+    qDebug() << "GPU: skipped (no OpenGL context)";
   }
 
   QVERIFY( true );
@@ -621,11 +886,11 @@ void TestQgsRasterGPUBenchmark::benchmarkComparison()
     const double speedup = ( gpu.avgMs > 0 ) ? cpu.avgMs / gpu.avgMs : 0;
 
     qDebug() << QString( "| %1 | %2 | %3 | %4x | %5 |" )
-      .arg( cpu.scenario, -14 )
-      .arg( cpu.avgMs, 8, 'f', 1 )
-      .arg( gpu.avgMs, 8, 'f', 1 )
-      .arg( speedup, 6, 'f', 1 )
-      .arg( gpu.fps > 0 ? QString::number( gpu.fps, 'f', 0 ) : QStringLiteral( "-" ), 7 );
+                  .arg( cpu.scenario, -14 )
+                  .arg( cpu.avgMs, 8, 'f', 1 )
+                  .arg( gpu.avgMs, 8, 'f', 1 )
+                  .arg( speedup, 6, 'f', 1 )
+                  .arg( gpu.fps > 0 ? QString::number( gpu.fps, 'f', 0 ) : u"-"_s, 7 );
 
     if ( speedup > 1.0 )
     {
@@ -676,6 +941,9 @@ void TestQgsRasterGPUBenchmark::benchmarkComparison()
       qDebug() << "           May be software rendering or slow hardware.";
     }
 
+    // Write JSON output for CI parsing
+    writeJsonOutput();
+
     QVERIFY( true );
   }
   else
@@ -686,6 +954,10 @@ void TestQgsRasterGPUBenchmark::benchmarkComparison()
     qDebug() << "  - Software OpenGL rendering (Mesa llvmpipe)";
     qDebug() << "  - GPU driver issues";
     qDebug() << "  - Test running on CI without GPU";
+
+    // Write JSON output for CI parsing
+    writeJsonOutput();
+
     // Don't fail - CI runners often use software rendering
     QVERIFY( true );
   }

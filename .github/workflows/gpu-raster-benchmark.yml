@@ -1,0 +1,329 @@
+---
+# =============================================================================
+# GPU Raster Rendering Benchmark Workflow
+# =============================================================================
+#
+# PURPOSE:
+#   Validates GPU-accelerated raster rendering performance vs CPU baseline.
+#   Runs benchmark tests on multiple platforms to demonstrate speedup claims.
+#
+# WHAT IT MEASURES:
+#   - CPU rendering time (traditional QPainter path)
+#   - GPU rendering time (OpenGL texture upload + shader)
+#   - Speedup factor (CPU_time / GPU_time)
+#
+# EXPECTED RESULTS:
+#   GPU rendering should be 3-10x faster than CPU for tiled rasters (COG).
+#   Actual speedup depends on hardware and tile count.
+#
+# HOW TO READ RESULTS:
+#   Check the "Benchmark Summary" step or the workflow summary for a table like:
+#
+#   | Platform | Tiles | CPU (ms) | GPU (ms) | Speedup |
+#   |----------|-------|----------|----------|---------|
+#   | Linux    | 100   | 150.2    | 45.3     | 3.3x    |
+#
+# PLATFORM SUPPORT:
+#   - Linux only (uses pre-built Docker image, ~5 min build)
+#   - macOS/Windows can be added later when merged to main QGIS repo
+#     (require vcpkg binary cache that's not available to forks)
+#
+# =============================================================================
+
+name: 🚀 GPU Raster Benchmark
+
+on:
+  push:
+    branches:
+      - master
+      - release-**
+      - feat/fast-cog-reader  # GPU raster feature branch
+    paths:
+      - 'src/gui/raster/qgsrastergpu*'
+      - 'tests/src/gui/testqgsrastergpu*'
+      - '.github/workflows/gpu-raster-benchmark.yml'
+  pull_request:
+    paths:
+      - 'src/gui/raster/qgsrastergpu*'
+      - 'tests/src/gui/testqgsrastergpu*'
+      - '.github/workflows/gpu-raster-benchmark.yml'
+  workflow_dispatch:
+    inputs:
+      tile_counts:
+        description: 'Tile counts to benchmark (comma-separated)'
+        default: '100,500,1000'
+        type: string
+      iterations:
+        description: 'Benchmark iterations per tile count'
+        default: '5'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Test COG file - NLCD 2024 Land Cover (large, tiled, representative)
+  COG_URL: "https://s3.us-east-1.amazonaws.com/ds-deck.gl-raster-public/cog/Annual_NLCD_LndCov_2024_CU_C1V1.tif"
+  COG_LOCAL_PATH: "/tmp/qgis-bench-cog.tif"
+
+jobs:
+  # ===========================================================================
+  # Download Test COG (shared across all platforms)
+  # ===========================================================================
+  download-cog:
+    name: 📥 Download Test Data
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Download Test COG (Byte)
+        run: |
+          curl -L -o /tmp/qgis-bench-cog.tif "${{ env.COG_URL }}"
+          ls -lh /tmp/qgis-bench-cog.tif
+
+      - name: 🔧 Generate Float32 Test COG
+        run: |
+          # Install GDAL for COG generation
+          sudo apt-get update && sudo apt-get install -y gdal-bin
+
+          # Create a 2048x2048 Float32 tiled COG with random-like data
+          # Using gdal_create + gdal_translate to make a proper COG
+          gdal_create -outsize 2048 2048 -bands 1 -ot Float32 \
+            -a_srs EPSG:4326 -a_ullr -180 90 180 -90 \
+            /tmp/temp_float32.tif
+
+          # Fill with gradient data using gdal_calc (simulates elevation/continuous data)
+          python3 -c "
+          from osgeo import gdal
+          import numpy as np
+          ds = gdal.Open('/tmp/temp_float32.tif', gdal.GA_Update)
+          band = ds.GetRasterBand(1)
+          # Create gradient + noise to simulate real continuous data
+          np.random.seed(42)
+          data = np.zeros((2048, 2048), dtype=np.float32)
+          y, x = np.mgrid[0:2048, 0:2048]
+          data = (x + y).astype(np.float32) / 4096.0 * 1000  # 0-1000 range
+          data += np.random.randn(2048, 2048).astype(np.float32) * 10  # noise
+          band.WriteArray(data)
+          ds = None
+          "
+
+          # Convert to COG with 512x512 tiles
+          gdal_translate -of COG -co BLOCKSIZE=512 -co COMPRESS=LZW \
+            /tmp/temp_float32.tif /tmp/qgis-bench-float32.tif
+
+          rm /tmp/temp_float32.tif
+          ls -lh /tmp/qgis-bench-*.tif
+
+      - name: 📤 Upload as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-cog
+          path: |
+            /tmp/qgis-bench-cog.tif
+            /tmp/qgis-bench-float32.tif
+          retention-days: 1
+
+  # ===========================================================================
+  # Linux Benchmark (Docker)
+  # ===========================================================================
+  benchmark-linux:
+    name: 🐧 Linux Benchmark
+    runs-on: ubuntu-latest
+    needs: download-cog
+
+    outputs:
+      results: ${{ steps.run-benchmark.outputs.results }}
+
+    steps:
+      - name: 🐣 Checkout
+        uses: actions/checkout@v6
+
+      - name: 📥 Download Test COG
+        uses: actions/download-artifact@v4
+        with:
+          name: test-cog
+          path: /tmp
+
+      - name: 🐳 Pull Pre-built Docker Image
+        run: |
+          # Use QGIS's pre-built image from Docker Hub (much faster than building)
+          docker pull qgis/qgis3-build-deps-ubuntu-qt6:master
+          docker tag qgis/qgis3-build-deps-ubuntu-qt6:master qgis3-build-deps
+
+      - name: 💾 Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-linux-benchmark-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-benchmark-
+
+      - name: 🔨 Configure and Build Benchmark Only
+        run: |
+          # Create ccache directory
+          mkdir -p ~/.ccache
+
+          # Only build the benchmark test target, not all of QGIS
+          docker run -t --name qgis_build \
+            -v $(pwd):/root/QGIS \
+            -v /tmp:/tmp \
+            -v ~/.ccache:/root/.ccache \
+            -e CCACHE_DIR=/root/.ccache \
+            -e CCACHE_MAXSIZE=1G \
+            qgis3-build-deps \
+            bash -c "
+              git config --global --add safe.directory /root/QGIS
+              mkdir -p /root/QGIS/build && cd /root/QGIS/build
+
+              # Show ccache stats before build
+              ccache -s || true
+
+              cmake .. -G Ninja \
+                -DWITH_GUI=ON \
+                -DWITH_DESKTOP=OFF \
+                -DWITH_3D=OFF \
+                -DWITH_QUICK=OFF \
+                -DWITH_BINDINGS=OFF \
+                -DWITH_SERVER=OFF \
+                -DWITH_GRASS=OFF \
+                -DWITH_PDAL=OFF \
+                -DWITH_INTERNAL_SPATIALINDEX=ON \
+                -DENABLE_TESTS=ON \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache
+
+              # Build only the benchmark test and its dependencies
+              ninja test_gui_rastergpubenchmark
+
+              # Show ccache stats after build
+              ccache -s || true
+            "
+
+      - name: 🏃 Run GPU Benchmark
+        id: run-benchmark
+        run: |
+          docker run -t --name qgis_benchmark \
+            -v $(pwd):/root/QGIS \
+            -v /tmp:/tmp \
+            -e DISPLAY=:99 \
+            -e QT_QPA_PLATFORM=offscreen \
+            -e MESA_GL_VERSION_OVERRIDE=3.3 \
+            qgis3-build-deps \
+            bash -c "
+              Xvfb :99 -screen 0 1024x768x24 &
+              sleep 2
+              cd /root/QGIS/build
+              # Run test executable directly (ctest doesn't find it when building single target)
+              ./output/bin/test_gui_rastergpubenchmark 2>&1 | tee /tmp/benchmark_output.txt
+            "
+
+          echo "## 🐧 Linux Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "**Platform**: Ubuntu (Mesa software rendering)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f /tmp/benchmark_output.txt ]; then
+            # Print key results to log (permanent, not in artifact)
+            echo "=========================================="
+            echo "=== KEY BENCHMARK RESULTS (LINUX) ==="
+            echo "=========================================="
+            grep -E "(Speedup|PASS|FAIL|CPU.*ms|GPU.*ms|tiles)" /tmp/benchmark_output.txt || true
+            echo "=========================================="
+
+            # Add to step summary (permanent in GitHub UI)
+            grep -A 30 "BENCHMARK_RESULTS" /tmp/benchmark_output.txt >> $GITHUB_STEP_SUMMARY || \
+              grep -E "(Speedup|CPU.*ms|GPU.*ms)" /tmp/benchmark_output.txt >> $GITHUB_STEP_SUMMARY || true
+
+            # Store in job output for summary job
+            echo "results<<EOF" >> $GITHUB_OUTPUT
+            cat /tmp/benchmark_output.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ No benchmark output file found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: 📊 Upload Benchmark Logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-linux
+          path: /tmp/benchmark_output.txt
+          retention-days: 30
+
+  # ===========================================================================
+  # Summary Job
+  # ===========================================================================
+  benchmark-summary:
+    name: 📊 Benchmark Summary
+    runs-on: ubuntu-latest
+    needs: [benchmark-linux]
+    if: always()
+
+    steps:
+      - name: 📋 Generate Summary
+        run: |
+          echo "# GPU Raster Rendering Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## What This Measures" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Measures the time from **GDAL tile read → rendered QImage**:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **CPU path**: \`GDALRasterIO\` → per-pixel color mapping in C++ → \`QPainter::drawImage\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **GPU path**: \`GDALReadBlock\` → texture upload → GLSL color mapping → \`glReadPixels\` → \`QPainter\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Test data: [NLCD 2024 COG](https://www.mrlc.gov/data/nlcd-2024-land-cover-conus) (512×512 tiles, Byte) + generated Float32 COG." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Test Scenarios" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scenario | What It Tests |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|---------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Initial Load | First render of ~100 tiles (cold cache) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pan | 12 renders with 25% viewport shift each |" >> $GITHUB_STEP_SUMMARY
+          echo "| Zoom | 6 renders at different zoom levels |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cache Hit | 5 re-renders of same extent |" >> $GITHUB_STEP_SUMMARY
+          echo "| Float32 | Continuous data type (DEM-like) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## CI Note" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "CI uses Mesa llvmpipe (software rendering). This validates correctness and relative performance." >> $GITHUB_STEP_SUMMARY
+          echo "Real GPUs show larger speedups due to parallel shader execution." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ needs.benchmark-linux.result }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: 📥 Download Benchmark Artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: benchmark-linux
+          path: benchmarks/
+
+      - name: 📊 Parse Results
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Speedup Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f "benchmarks/benchmark_output.txt" ]; then
+            # Extract and display the results table
+            echo "| Scenario | Speedup |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|---------|" >> $GITHUB_STEP_SUMMARY
+
+            for scenario in "Initial Load" "Pan" "Zoom" "Cache Hit" "Float32 Load" "Float32 Pan" "Float32 Zoom"; do
+              speedup=$(grep -E "^\| *${scenario}" "benchmarks/benchmark_output.txt" 2>/dev/null | sed -n 's/.*| *\([0-9.]*\)x.*/\1x/p' | head -1)
+              [ -n "$speedup" ] && echo "| ${scenario} | ${speedup} |" >> $GITHUB_STEP_SUMMARY
+            done
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "<details>" >> $GITHUB_STEP_SUMMARY
+            echo "<summary>Full Log</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -150 "benchmarks/benchmark_output.txt" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No benchmark output available" >> $GITHUB_STEP_SUMMARY
+          fi
