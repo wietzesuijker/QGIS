@@ -59,6 +59,7 @@ class GUI_EXPORT QgsRasterGPUShaders
       Byte,         //!< 8-bit unsigned integer (R8)
       UInt16,       //!< 16-bit unsigned integer (R16)
       Float32,      //!< 32-bit float (R32F)
+      RGB8,         //!< 8-bit RGB (RGB8) - multi-band color rendering
       RGBA8,        //!< 8-bit RGBA (RGBA8)
       BytePaletted, //!< 8-bit with color table lookup
     };

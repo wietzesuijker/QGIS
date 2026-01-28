@@ -159,6 +159,41 @@ QString QgsRasterGPUShaders::fragmentShaderSource( ShaderType type )
     case ShaderType::Float32:
       return singleChannelShader( 1.0 );
 
+    case ShaderType::RGB8:
+      if ( supportsGLSL330() )
+      {
+        return R"SHADER(
+#version 330 core
+
+in vec2 vTexCoord;
+out vec4 fragColor;
+
+uniform sampler2D uTileTexture;
+uniform float uOpacity;
+
+void main() {
+  vec3 color = texture(uTileTexture, vTexCoord).rgb;
+  fragColor = vec4(color, uOpacity);
+}
+)SHADER";
+      }
+      else
+      {
+        return R"SHADER(
+#version 120
+
+varying vec2 vTexCoord;
+
+uniform sampler2D uTileTexture;
+uniform float uOpacity;
+
+void main() {
+  vec3 color = texture2D(uTileTexture, vTexCoord).rgb;
+  gl_FragColor = vec4(color, uOpacity);
+}
+)SHADER";
+      }
+
     case ShaderType::RGBA8:
       if ( supportsGLSL330() )
       {
@@ -292,7 +327,7 @@ void QgsRasterGPUShaders::updateShaderUniforms( QOpenGLShaderProgram *program, c
   program->setUniformValue( "uOpacity", config.opacity );
 
   // Type-specific uniforms
-  if ( config.type != ShaderType::RGBA8 && config.type != ShaderType::BytePaletted )
+  if ( config.type != ShaderType::RGB8 && config.type != ShaderType::RGBA8 && config.type != ShaderType::BytePaletted )
   {
     program->setUniformValue( "uMinValue", config.minValue );
     program->setUniformValue( "uMaxValue", config.maxValue );

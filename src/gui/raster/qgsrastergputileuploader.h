@@ -76,6 +76,18 @@ class GUI_EXPORT QgsRasterGPUTileUploader : protected QOpenGLFunctions
     GPUTile uploadTile( int overviewLevel, int tileX, int tileY, int bandNumber = 1 );
 
     /**
+     * \brief Upload an RGB tile to GPU (multi-band)
+     * \param overviewLevel Overview level
+     * \param tileX Tile X index
+     * \param tileY Tile Y index
+     * \param redBand Red band number (1-based)
+     * \param greenBand Green band number (1-based)
+     * \param blueBand Blue band number (1-based)
+     * \returns GPU tile info, or invalid tile on failure
+     */
+    GPUTile uploadRGBTile( int overviewLevel, int tileX, int tileY, int redBand, int greenBand, int blueBand );
+
+    /**
      * \brief Get or create GPU tile (with caching)
      * \param overviewLevel Overview level
      * \param tileX Tile X index
@@ -85,6 +97,19 @@ class GUI_EXPORT QgsRasterGPUTileUploader : protected QOpenGLFunctions
      * \returns GPU tile from cache or newly uploaded
      */
     GPUTile getTile( int overviewLevel, int tileX, int tileY, int bandNumber, quint64 frameNumber );
+
+    /**
+     * \brief Get or create RGB GPU tile (with caching)
+     * \param overviewLevel Overview level
+     * \param tileX Tile X index
+     * \param tileY Tile Y index
+     * \param redBand Red band number (1-based)
+     * \param greenBand Green band number (1-based)
+     * \param blueBand Blue band number (1-based)
+     * \param frameNumber Current frame number (for LRU)
+     * \returns GPU tile from cache or newly uploaded
+     */
+    GPUTile getRGBTile( int overviewLevel, int tileX, int tileY, int redBand, int greenBand, int blueBand, quint64 frameNumber );
 
     /**
      * \brief Clear tile cache and release GPU resources
@@ -131,15 +156,23 @@ class GUI_EXPORT QgsRasterGPUTileUploader : protected QOpenGLFunctions
 
   private:
     /**
-     * \brief Create tile cache key
+     * \brief Create tile cache key for single-band
      */
     static quint64 makeTileKey( int overview, int tileX, int tileY, int band );
+
+    /**
+     * \brief Create tile cache key for RGB (multi-band)
+     */
+    static quint64 makeRGBTileKey( int overview, int tileX, int tileY, int redBand, int greenBand, int blueBand );
 
     //! COG tile reader
     QgsRasterTileReader *mReader = nullptr;
 
-    //! Texture format info
+    //! Texture format info for single-band
     QgsRasterTextureFormat::FormatInfo mTextureFormat;
+
+    //! Texture format info for RGB (multi-band)
+    QgsRasterTextureFormat::FormatInfo mRGBTextureFormat;
 
     //! Tile cache
     QHash<quint64, GPUTile> mTileCache;

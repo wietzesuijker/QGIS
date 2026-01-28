@@ -33,11 +33,13 @@ QgsRasterGPUTileUploader::QgsRasterGPUTileUploader( QgsRasterTileReader *reader 
   if ( mReader && mReader->isValid() )
   {
     const auto tileInfo = mReader->tileInfo( 0 );
-    // Get format for the raster's data type
+    // Get format for the raster's data type (single-band)
     mTextureFormat = QgsRasterTextureFormat::getFormat(
       static_cast<Qgis::DataType>( tileInfo.dataType ),
       tileInfo.bandCount
     );
+    // Get format for RGB rendering (3-channel byte)
+    mRGBTextureFormat = QgsRasterTextureFormat::getFormat( Qgis::DataType::Byte, 3 );
   }
 }
 
@@ -54,6 +56,13 @@ quint64 QgsRasterGPUTileUploader::makeTileKey( int overview, int tileX, int tile
 {
   // Pack into 64-bit key: [16-bit overview][16-bit band][16-bit Y][16-bit X]
   return ( static_cast<quint64>( overview & 0xFFFF ) << 48 ) | ( static_cast<quint64>( band & 0xFFFF ) << 32 ) | ( static_cast<quint64>( tileY & 0xFFFF ) << 16 ) | ( static_cast<quint64>( tileX & 0xFFFF ) );
+}
+
+quint64 QgsRasterGPUTileUploader::makeRGBTileKey( int overview, int tileX, int tileY, int redBand, int greenBand, int blueBand )
+{
+  // Pack into 64-bit key with RGB marker (0xFF in high bits to distinguish from single-band)
+  // [8-bit marker=0xFF][8-bit overview][8-bit R][8-bit G][8-bit B][8-bit Y][16-bit X]
+  return ( static_cast<quint64>( 0xFF ) << 56 ) | ( static_cast<quint64>( overview & 0xFF ) << 48 ) | ( static_cast<quint64>( redBand & 0xFF ) << 40 ) | ( static_cast<quint64>( greenBand & 0xFF ) << 32 ) | ( static_cast<quint64>( blueBand & 0xFF ) << 24 ) | ( static_cast<quint64>( tileY & 0xFF ) << 16 ) | ( static_cast<quint64>( tileX & 0xFFFF ) );
 }
 
 QgsRasterGPUTileUploader::GPUTile QgsRasterGPUTileUploader::uploadTile(
@@ -144,6 +153,106 @@ QgsRasterGPUTileUploader::GPUTile QgsRasterGPUTileUploader::getTile(
 
   // Upload new tile
   GPUTile tile = uploadTile( overviewLevel, tileX, tileY, bandNumber );
+  if ( tile.isValid )
+  {
+    tile.lastUsedFrame = frameNumber;
+    mTileCache[key] = tile;
+  }
+
+  return tile;
+}
+
+QgsRasterGPUTileUploader::GPUTile QgsRasterGPUTileUploader::uploadRGBTile(
+  int overviewLevel, int tileX, int tileY, int redBand, int greenBand, int blueBand
+)
+{
+  GPUTile result;
+
+  if ( !mReader || !mReader->isValid() || !mGLInitialized )
+  {
+    QgsDebugError( u"GPU uploader not initialized"_s );
+    return result;
+  }
+
+  // Read multi-band tile data (interleaved RGB)
+  const QList<int> bands = { redBand, greenBand, blueBand };
+  if ( !mReader->readTileMultiBand( overviewLevel, tileX, tileY, bands, mTileBuffer ) )
+  {
+    QgsDebugError( u"Failed to read RGB tile %1,%2 overview %3 (bands %4,%5,%6)"_s
+                     .arg( tileX )
+                     .arg( tileY )
+                     .arg( overviewLevel )
+                     .arg( redBand )
+                     .arg( greenBand )
+                     .arg( blueBand ) );
+    return result;
+  }
+
+  const auto tileInfo = mReader->tileInfo( overviewLevel );
+
+  // Create OpenGL texture
+  GLuint textureId = 0;
+  glGenTextures( 1, &textureId );
+  glBindTexture( GL_TEXTURE_2D, textureId );
+
+  // Set texture parameters
+  glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+  glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+  glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+  glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+
+  // Upload RGB data to GPU texture
+  glTexImage2D(
+    GL_TEXTURE_2D,
+    0, // mip level
+    mRGBTextureFormat.internalFormat,
+    tileInfo.width,
+    tileInfo.height,
+    0, // border (must be 0)
+    mRGBTextureFormat.format,
+    mRGBTextureFormat.type,
+    mTileBuffer.constData()
+  );
+
+  glBindTexture( GL_TEXTURE_2D, 0 );
+
+  // Check for errors
+  const GLenum error = glGetError();
+  if ( error != GL_NO_ERROR )
+  {
+    QgsDebugError( u"OpenGL error uploading RGB tile: %1"_s.arg( error ) );
+    glDeleteTextures( 1, &textureId );
+    return result;
+  }
+
+  // Fill result
+  result.textureId = textureId;
+  result.width = tileInfo.width;
+  result.height = tileInfo.height;
+  result.lastUsedFrame = 0;
+  result.isValid = true;
+
+  return result;
+}
+
+QgsRasterGPUTileUploader::GPUTile QgsRasterGPUTileUploader::getRGBTile(
+  int overviewLevel, int tileX, int tileY, int redBand, int greenBand, int blueBand, quint64 frameNumber
+)
+{
+  QMutexLocker locker( &mMutex );
+
+  const quint64 key = makeRGBTileKey( overviewLevel, tileX, tileY, redBand, greenBand, blueBand );
+
+  // Check cache
+  if ( mTileCache.contains( key ) )
+  {
+    GPUTile &tile = mTileCache[key];
+    tile.lastUsedFrame = frameNumber;
+    return tile;
+  }
+
+  // Upload new RGB tile
+  GPUTile tile = uploadRGBTile( overviewLevel, tileX, tileY, redBand, greenBand, blueBand );
   if ( tile.isValid )
   {
     tile.lastUsedFrame = frameNumber;

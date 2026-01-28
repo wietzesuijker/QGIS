@@ -57,6 +57,13 @@ class QgsCoordinateReferenceSystem;
  * Thread safety: GPU rendering only works on the thread that initialized
  * QgsRasterGPUFactory. Other threads fall back to CPU rendering automatically.
  *
+ * Supports both single-band (with colormap) and multi-band RGB rendering.
+ * Use setRGBBands() to enable multi-band color rendering from QgsMultiBandColorRenderer.
+ *
+ * Current limitation:
+ *
+ * - No on-GPU reprojection. Falls back to CPU when CRS transformation needed.
+ *
  * Inspired by deck.gl-raster's WebGL rendering approach.
  *
  * \since QGIS 3.40
@@ -90,6 +97,22 @@ class GUI_EXPORT QgsRasterGPURenderer : protected QOpenGLFunctions
      * Get current opacity
      */
     float opacity() const { return mOpacity; }
+
+    /**
+     * Set RGB band numbers for multi-band color rendering.
+     * Call this with band numbers from QgsMultiBandColorRenderer.
+     * When RGB mode is set, the renderer uses 3-channel textures
+     * instead of single-band with colormap lookup.
+     * \param redBand Red band number (1-based)
+     * \param greenBand Green band number (1-based)
+     * \param blueBand Blue band number (1-based)
+     */
+    void setRGBBands( int redBand, int greenBand, int blueBand );
+
+    /**
+     * Returns TRUE if RGB mode is enabled (multi-band rendering).
+     */
+    bool isRGBMode() const { return mRGBMode; }
 
   private:
     struct TileCoord
@@ -140,8 +163,13 @@ class GUI_EXPORT QgsRasterGPURenderer : protected QOpenGLFunctions
     float mOpacity = 1.0f;
     quint64 mFrameNumber = 0;
 
+    // RGB mode (multi-band rendering)
+    bool mRGBMode = false;
+    int mRedBand = 1;
+    int mGreenBand = 2;
+    int mBlueBand = 3;
+
     // Vertex buffer for tile quads
-    GLuint mVAO = 0;
     GLuint mVBO = 0;
 
     // Colormap texture (1D lookup, deck.gl pattern)

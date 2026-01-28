@@ -16,12 +16,14 @@
 #include "qgsrastergpufactory.h"
 
 #include "qgslogger.h"
+#include "qgsmultibandcolorrenderer.h"
 #include "qgsrasterdataprovider.h"
 #include "qgsrastergpucachemanager.h"
 #include "qgsrastergpurenderer.h"
 #include "qgsrastergputileuploader.h"
 #include "qgsrasterlayerrenderer.h"
 #include "qgsrasterpipe.h"
+#include "qgsrasterrenderer.h"
 #include "qgsrendercontext.h"
 
 #include <QCoreApplication>
@@ -89,6 +91,24 @@ namespace
 
     // Create GPU renderer (lightweight, uses cached uploader and textures)
     QgsRasterGPURenderer gpuRenderer( uploader );
+
+    // Check for multi-band color renderer and configure RGB mode
+    QgsRasterRenderer *rasterRenderer = pipe ? pipe->renderer() : nullptr;
+    if ( rasterRenderer )
+    {
+      if ( QgsMultiBandColorRenderer *mbRenderer = dynamic_cast<QgsMultiBandColorRenderer *>( rasterRenderer ) )
+      {
+        const int redBand = mbRenderer->redBand();
+        const int greenBand = mbRenderer->greenBand();
+        const int blueBand = mbRenderer->blueBand();
+
+        if ( redBand > 0 && greenBand > 0 && blueBand > 0 )
+        {
+          gpuRenderer.setRGBBands( redBand, greenBand, blueBand );
+          QgsDebugMsgLevel( u"GPU rendering using RGB bands: R=%1, G=%2, B=%3"_s.arg( redBand ).arg( greenBand ).arg( blueBand ), 3 );
+        }
+      }
+    }
 
     // Attempt GPU rendering
     try

@@ -37,6 +37,26 @@
 
 using namespace Qt::StringLiterals;
 
+void QgsRasterGPURenderer::setRGBBands( int redBand, int greenBand, int blueBand )
+{
+  mRGBMode = true;
+  mRedBand = redBand;
+  mGreenBand = greenBand;
+  mBlueBand = blueBand;
+
+  // Force shader recreation on next render
+  if ( mShaderProgram )
+  {
+    delete mShaderProgram;
+    mShaderProgram = nullptr;
+  }
+  if ( mColormapTexture )
+  {
+    glDeleteTextures( 1, &mColormapTexture );
+    mColormapTexture = 0;
+  }
+}
+
 QgsRasterGPURenderer::QgsRasterGPURenderer( QgsRasterGPUTileUploader *tileUploader )
   : mTileUploader( tileUploader )
 {
@@ -151,9 +171,16 @@ bool QgsRasterGPURenderer::render( QgsRenderContext &renderContext, QgsRasterVie
     }
 
     // Upload tile to GPU (uses cache)
-    // TODO: Support multi-band rendering by getting band selection from QgsRasterRenderer
-    const int bandNumber = 1;
-    const auto gpuTile = mTileUploader->getTile( tileCoord.level, tileCoord.x, tileCoord.y, bandNumber, mFrameNumber );
+    QgsRasterGPUTileUploader::GPUTile gpuTile;
+    if ( mRGBMode )
+    {
+      gpuTile = mTileUploader->getRGBTile( tileCoord.level, tileCoord.x, tileCoord.y, mRedBand, mGreenBand, mBlueBand, mFrameNumber );
+    }
+    else
+    {
+      const int bandNumber = 1;
+      gpuTile = mTileUploader->getTile( tileCoord.level, tileCoord.x, tileCoord.y, bandNumber, mFrameNumber );
+    }
 
     if ( !gpuTile.isValid )
     {
@@ -163,6 +190,11 @@ bool QgsRasterGPURenderer::render( QgsRenderContext &renderContext, QgsRasterVie
 
     // Calculate tile extent in map coordinates
     const QgsRectangle tileExtent = mTileUploader->tileExtent( tileCoord.level, tileCoord.x, tileCoord.y );
+    if ( tileExtent.isEmpty() )
+    {
+      QgsDebugMsgLevel( u"Invalid tile extent for tile %1/%2/%3"_s.arg( tileCoord.level ).arg( tileCoord.x ).arg( tileCoord.y ), 4 );
+      continue;
+    }
 
     // Render the tile quad
     renderTileQuad( gpuTile.textureId, tileExtent, renderContext );
@@ -183,17 +215,16 @@ bool QgsRasterGPURenderer::render( QgsRenderContext &renderContext, QgsRasterVie
   // Release FBO
   mFBO->release();
 
-  // Draw the GPU-rendered image to QPainter for compositing with labels, vectors, etc.
+  // Composite GPU-rendered image via QPainter for labels, vectors, etc.
   QPainter *painter = renderContext.painter();
-  if ( painter && !gpuImage.isNull() )
+  if ( gpuImage.isNull() )
   {
-    // Calculate device coordinates for the raster
-    // The image covers the viewport extent
+    QgsDebugError( u"FBO toImage() returned null image"_s );
+  }
+  else if ( painter )
+  {
     const QPointF topLeft = renderContext.mapToPixel().transform( rasterViewPort->mDrawnExtent.xMinimum(), rasterViewPort->mDrawnExtent.yMaximum() ).toQPointF();
-
     painter->drawImage( topLeft, gpuImage );
-
-    QgsDebugMsgLevel( u"GPU image composited to QPainter at (%1, %2)"_s.arg( topLeft.x() ).arg( topLeft.y() ), 3 );
   }
 
   // Increment frame number for LRU cache
@@ -234,16 +265,22 @@ QVector<QgsRasterGPURenderer::TileCoord> QgsRasterGPURenderer::calculateVisibleT
 
   // Get tile info for this overview level
   const auto tileInfo = mTileUploader->tileInfo( overviewLevel );
-  if ( !tileInfo.isTiled )
+  if ( !tileInfo.isTiled || tileInfo.tilesX <= 0 || tileInfo.tilesY <= 0 )
   {
-    QgsDebugMsgLevel( u"Raster is not tiled, falling back to CPU path"_s, 2 );
+    QgsDebugMsgLevel( u"Raster is not tiled or has invalid tile dimensions, falling back to CPU path"_s, 2 );
     return tiles;
   }
 
   // Get raster extent
   const QgsRectangle rasterExtent = mTileUploader->rasterExtent();
+  if ( rasterExtent.isEmpty() )
+  {
+    QgsDebugMsgLevel( u"Raster extent is empty"_s, 2 );
+    return tiles;
+  }
 
   // Calculate tile size in georeferenced units
+  // Division is safe: tilesX/Y > 0 and extent is non-empty (positive dimensions)
   const double tileWidth = rasterExtent.width() / tileInfo.tilesX;
   const double tileHeight = rasterExtent.height() / tileInfo.tilesY;
 
@@ -285,10 +322,13 @@ void QgsRasterGPURenderer::renderTileQuad( GLuint textureId, const QgsRectangle 
   glBindTexture( GL_TEXTURE_2D, textureId );
   mShaderProgram->setUniformValue( "uTileTexture", 0 );
 
-  // Bind colormap texture to unit 1 (deck.gl pattern)
-  glActiveTexture( GL_TEXTURE1 );
-  glBindTexture( GL_TEXTURE_2D, mColormapTexture );
-  mShaderProgram->setUniformValue( "uColormapTexture", 1 );
+  // Bind colormap texture to unit 1 (single-band mode only)
+  if ( !mRGBMode && mColormapTexture )
+  {
+    glActiveTexture( GL_TEXTURE1 );
+    glBindTexture( GL_TEXTURE_2D, mColormapTexture );
+    mShaderProgram->setUniformValue( "uColormapTexture", 1 );
+  }
 
   // Build MVP matrix (map extent → screen coordinates)
   // Transform from tile's map coordinates to normalized device coordinates [-1, 1]
@@ -356,20 +396,29 @@ void QgsRasterGPURenderer::renderTileQuad( GLuint textureId, const QgsRectangle 
 
 bool QgsRasterGPURenderer::createShaderProgram()
 {
-  // Create shader configuration with default values
-  // Future enhancement: Get data type and color ramp from QgsRasterRenderer
+  // Create shader configuration based on rendering mode
   QgsRasterGPUShaders::ShaderConfig config;
-  config.type = QgsRasterGPUShaders::ShaderType::Byte;
   config.opacity = mOpacity;
 
-  // Default grayscale color ramp (black → white)
-  config.colorRamp = {
-    { 0.0f, QColor( 0, 0, 0 ) },
-    { 1.0f, QColor( 255, 255, 255 ) }
-  };
+  if ( mRGBMode )
+  {
+    // RGB mode: direct RGB output, no colormap
+    config.type = QgsRasterGPUShaders::ShaderType::RGB8;
+  }
+  else
+  {
+    // Single-band mode: colormap lookup
+    config.type = QgsRasterGPUShaders::ShaderType::Byte;
 
-  config.minValue = 0.0f;
-  config.maxValue = 255.0f;
+    // Default grayscale color ramp (black → white)
+    config.colorRamp = {
+      { 0.0f, QColor( 0, 0, 0 ) },
+      { 1.0f, QColor( 255, 255, 255 ) }
+    };
+
+    config.minValue = 0.0f;
+    config.maxValue = 255.0f;
+  }
 
   mShaderProgram = QgsRasterGPUShaders::createShaderProgram( config );
 
@@ -379,14 +428,17 @@ bool QgsRasterGPURenderer::createShaderProgram()
     return false;
   }
 
-  // Create colormap texture (deck.gl pattern: 1D texture lookup)
-  mColormapTexture = QgsRasterGPUShaders::createColormapTexture( config.colorRamp );
-  if ( !mColormapTexture )
+  // Create colormap texture only for single-band mode
+  if ( !mRGBMode )
   {
-    QgsDebugError( u"Failed to create colormap texture"_s );
-    delete mShaderProgram;
-    mShaderProgram = nullptr;
-    return false;
+    mColormapTexture = QgsRasterGPUShaders::createColormapTexture( config.colorRamp );
+    if ( !mColormapTexture )
+    {
+      QgsDebugError( u"Failed to create colormap texture"_s );
+      delete mShaderProgram;
+      mShaderProgram = nullptr;
+      return false;
+    }
   }
 
   // Update uniforms
