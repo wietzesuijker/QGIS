@@ -31,6 +31,11 @@ set(QGIS_GUI_SRCS
   raster/qgsrastertransparencywidget.cpp
   raster/qgshillshaderendererwidget.cpp
   raster/qgsresamplingutils.cpp
+  raster/qgsrastertextureformats.cpp
+  raster/qgsrastergpucachemanager.cpp
+  raster/qgsrastergputileuploader.cpp
+  raster/qgsrastergpurenderer.cpp
+  raster/qgsrastergpufactory.cpp
 
   vector/qgsattributeactiondialog.cpp
   vector/qgsattributeactionpropertiesdialog.cpp
@@ -700,6 +705,7 @@ set(QGIS_GUI_SRCS
   qgsmapcanvasannotationitem.cpp
   qgsmapcanvasitem.cpp
   qgsmapcanvasmap.cpp
+  qgsmapcanvasgpu.cpp
   qgsmapcanvassnappingutils.cpp
   qgsmapcanvastracer.cpp
   qgsmapcanvasutils.cpp
@@ -973,6 +979,7 @@ set(QGIS_GUI_HDRS
   qgsmapcanvasinteractionblocker.h
   qgsmapcanvasitem.h
   qgsmapcanvasmap.h
+  qgsmapcanvasgpu.h
   qgsmapcanvassnappingutils.h
   qgsmapcanvastracer.h
   qgsmapcanvasutils.h
@@ -2015,6 +2022,38 @@ find_package(Qt6 COMPONENTS SvgWidgets REQUIRED)
 target_link_libraries(qgis_gui
   Qt6::SvgWidgets
 )
+
+# QRhi for GPU raster rendering (Qt's rendering hardware abstraction)
+# Requires Qt6::ShaderTools for shader compilation and Qt6::GuiPrivate for QRhi access
+find_package(Qt6 COMPONENTS ShaderTools QUIET)
+# GuiPrivate is part of Qt6::Gui but needs explicit find on some systems (e.g., Homebrew)
+if(TARGET Qt6::GuiPrivate)
+  set(Qt6GuiPrivate_FOUND TRUE)
+else()
+  # Try to find it explicitly (Homebrew Qt may need this)
+  find_package(Qt6 COMPONENTS GuiPrivate QUIET)
+endif()
+
+if(Qt6ShaderTools_FOUND AND Qt6GuiPrivate_FOUND)
+  target_link_libraries(qgis_gui Qt6::GuiPrivate)
+
+  qt6_add_shaders(qgis_gui "qgis_gpu_raster_shaders"
+    PREFIX "/shaders"
+    FILES
+      raster/shaders/raster_tile.vert
+      raster/shaders/raster_colormap.frag
+      raster/shaders/raster_rgb.frag
+      raster/shaders/raster_rgba.frag
+      raster/shaders/raster_paletted.frag
+  )
+  # PUBLIC so tests can see the rhi() method declaration
+  target_compile_definitions(qgis_gui PUBLIC HAVE_QRHI=1)
+  message(STATUS "QRhi GPU raster rendering: enabled")
+elseif(Qt6ShaderTools_FOUND)
+  message(STATUS "QRhi GPU raster rendering: disabled (Qt6::GuiPrivate not found)")
+else()
+  message(STATUS "QRhi GPU raster rendering: disabled (Qt6::ShaderTools not found)")
+endif()
 
 if (WITH_QTWEBENGINE)
   find_package(${QT_VERSION_BASE} COMPONENTS WebEngineWidgets REQUIRED)
