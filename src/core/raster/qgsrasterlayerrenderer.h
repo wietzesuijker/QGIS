@@ -21,6 +21,8 @@
 #include "qgsmapclippingregion.h"
 #include "qgsmaplayerrenderer.h"
 
+#include <functional>
+
 class QPainter;
 
 class QgsMapToPixel;
@@ -75,6 +77,54 @@ class CORE_EXPORT QgsRasterLayerRenderer : public QgsMapLayerRenderer
     QgsFeedback *feedback() const override;
     bool forceRasterRender() const override;
 
+    /**
+     * \brief GPU renderer factory function type
+     *
+     * Factory function that attempts GPU-accelerated rendering.
+     * Returns TRUE if rendering succeeded via GPU, FALSE to fallback to CPU.
+     *
+     * Design rationale:
+     * GPU rendering requires OpenGL which lives in src/gui (Qt's QOpenGL classes).
+     * To keep core independent of gui, we use a factory callback that gui code
+     * registers at startup. This allows:
+     *
+     * - src/core/raster/ to remain free of OpenGL dependencies
+     * - GPU rendering to be optional (no factory = CPU-only)
+     * - Clean separation: tile reading (core) vs texture upload (gui)
+     *
+     * Thread safety:
+     * The factory must check that rendering is called from the thread that owns
+     * the OpenGL context. Worker threads should return FALSE to trigger CPU fallback.
+     *
+     * \since QGIS 3.44
+     */
+    using GpuRendererFactory = std::function<bool(
+      QgsRenderContext &context,
+      QgsRasterViewPort *viewport,
+      QgsRasterPipe *pipe,
+      QgsFeedback *feedback
+    )>;
+
+    /**
+     * \brief Set GPU renderer factory
+     *
+     * Registers a factory function that will be called to attempt GPU rendering
+     * before falling back to CPU. Set to nullptr to disable GPU rendering.
+     *
+     * This allows GUI code to inject GPU rendering capability into core rendering.
+     *
+     * \param factory GPU renderer factory function, or nullptr to disable
+     * \since QGIS 3.44
+     */
+    static void setGpuRendererFactory( GpuRendererFactory factory );
+
+    /**
+     * \brief Check if GPU rendering is available
+     * \returns TRUE if a GPU renderer factory is registered
+     * \since QGIS 3.44
+     */
+    static bool gpuRenderingAvailable();
+
   private:
 
     void prepareLabeling( QgsRasterLayer *layer );
@@ -106,6 +156,12 @@ class CORE_EXPORT QgsRasterLayerRenderer : public QgsMapLayerRenderer
     QgsRasterLayerLabelProvider *mLabelProvider = nullptr;
 
     void drawElevationMap();
+
+    //! Static GPU renderer factory
+    static GpuRendererFactory sGpuRendererFactory;
+
+    //! Whether to attempt GPU rendering for this layer
+    bool mTryGpuPath = false;
 
     friend class QgsRasterLayerRendererFeedback;
 };
