@@ -792,6 +792,7 @@ set(QGIS_CORE_SRCS
 
   raster/qgsrasterattributetable.cpp
   raster/qgscliptominmaxenhancement.cpp
+  raster/qgsrastertilereader.cpp
   raster/qgscolorrampshader.cpp
   raster/qgscontrastenhancement.cpp
   raster/qgscontrastenhancementfunction.cpp
@@ -1962,6 +1963,7 @@ set(QGIS_CORE_HDRS
   raster/qgsrasterbandstats.h
   raster/qgsrasterblock.h
   raster/qgsrasterchecker.h
+  raster/qgsrastertilereader.h
   raster/qgsrastercontourrenderer.h
   raster/qgsrasterdataprovider.h
   raster/qgsrasterdataproviderelevationproperties.h
