@@ -13,14 +13,18 @@
  *                                                                         *
  ***************************************************************************/
 
-#include "qgstest.h"
+#include <gdal.h>
+
 #include "qgsapplication.h"
 #include "qgsrastertextureformats.h"
 #include "qgsrastertilereader.h"
+#include "qgstest.h"
 
 #include <QDir>
 #include <QFile>
-#include <gdal.h>
+#include <QString>
+
+using namespace Qt::StringLiterals;
 
 /**
  * \ingroup UnitTests
@@ -38,7 +42,7 @@ class TestQgsRasterGPU : public QgsTest
 
   public:
     TestQgsRasterGPU()
-      : QgsTest( QStringLiteral( "GPU Raster Rendering Tests" ) ) {}
+      : QgsTest( u"GPU Raster Rendering Tests"_s ) {}
 
   private slots:
     void initTestCase();

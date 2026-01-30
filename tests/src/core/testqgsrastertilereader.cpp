@@ -13,14 +13,18 @@
  *                                                                         *
  ***************************************************************************/
 
-#include "qgstest.h"
-#include "qgsrastertilereader.h"
+#include <gdal.h>
+
+#include "qgsapplication.h"
 #include "qgsrasterdataprovider.h"
 #include "qgsrasterlayer.h"
-#include "qgsapplication.h"
+#include "qgsrastertilereader.h"
+#include "qgstest.h"
 
 #include <QElapsedTimer>
-#include <gdal.h>
+#include <QString>
+
+using namespace Qt::StringLiterals;
 
 class TestQgsRasterTileReader : public QgsTest
 {
@@ -28,7 +32,7 @@ class TestQgsRasterTileReader : public QgsTest
 
   public:
     TestQgsRasterTileReader()
-      : QgsTest( QStringLiteral( "COG Tile Reader Tests" ) ) {}
+      : QgsTest( u"COG Tile Reader Tests"_s ) {}
 
   private slots:
     void initTestCase();

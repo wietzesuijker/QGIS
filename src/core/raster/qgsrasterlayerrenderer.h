@@ -18,10 +18,10 @@
 
 #define SIP_NO_FILE
 
+#include <functional>
+
 #include "qgsmapclippingregion.h"
 #include "qgsmaplayerrenderer.h"
-
-#include <functional>
 
 class QPainter;
 
@@ -99,11 +99,11 @@ class CORE_EXPORT QgsRasterLayerRenderer : public QgsMapLayerRenderer
      * \since QGIS 3.44
      */
     using GpuRendererFactory = std::function<bool(
-      QgsRenderContext &context,
-      QgsRasterViewPort *viewport,
-      QgsRasterPipe *pipe,
-      QgsFeedback *feedback
-    )>;
+                                 QgsRenderContext &context,
+                                 QgsRasterViewPort *viewport,
+                                 QgsRasterPipe *pipe,
+                                 QgsFeedback *feedback
+                               )>;
 
     /**
      * \brief Set GPU renderer factory

@@ -26,7 +26,10 @@
 #include <QOffscreenSurface>
 #include <QSurfaceFormat>
 
+#include "qgsbrightnesscontrastfilter.h"
+#include "qgscolorrampshader.h"
 #include "qgscontrastenhancement.h"
+#include "qgshuesaturationfilter.h"
 #include "qgsmultibandcolorrenderer.h"
 #include "qgsproject.h"
 #include "qgsrasterdataprovider.h"
@@ -36,8 +39,12 @@
 #include "qgsrastergputileuploader.h"
 #include "qgsrasterpipe.h"
 #include "qgsrasterrenderer.h"
+#include "qgsrastershader.h"
 #include "qgsrendercontext.h"
 #include "qgssinglebandgrayrenderer.h"
+#include "qgssinglebandpseudocolorrenderer.h"
+#include "qgspalettedrasterrenderer.h"
+#include "qgshillshaderenderer.h"
 
 using namespace Qt::StringLiterals;
 
@@ -63,6 +70,9 @@ namespace
 
   // QRhi instance (owned by this factory)
   static std::unique_ptr<QRhi> sRhi;
+
+  // OpenGL fallback surface (owned by this factory, cleaned up in cleanup())
+  static std::unique_ptr<QOffscreenSurface> sFallbackSurface;
 
   /**
    * \brief Create QRhi with platform-appropriate backend
@@ -120,7 +130,7 @@ namespace
     // - Software rendering is detected (e.g., CI with xvfb)
     const QString platform = QString::fromLatin1( qgetenv( "QT_QPA_PLATFORM" ) );
 
-    if ( platform != u"offscreen"_s && !isSoftwareRendering )
+    if ( platform != "offscreen"_L1 && !isSoftwareRendering )
     {
       QRhiVulkanInitParams vulkanParams;
       rhi.reset( QRhi::create( QRhi::Vulkan, &vulkanParams, flags ) );
@@ -140,40 +150,35 @@ namespace
     // Fallback: OpenGL ES 2 (compatible mode)
     // Per Qt docs: use newFallbackSurface() for properly configured surface
     // See: https://doc.qt.io/qt-6/qrhigles2initparams.html
-    static QOffscreenSurface *sFallbackSurface = nullptr;
     if ( !sFallbackSurface )
     {
       // Try Qt's recommended method first
-      sFallbackSurface = QRhiGles2InitParams::newFallbackSurface();
+      sFallbackSurface.reset( QRhiGles2InitParams::newFallbackSurface() );
 
       // If that fails (e.g. headless CI), create manually with minimal requirements
       if ( !sFallbackSurface || !sFallbackSurface->isValid() )
       {
         qWarning() << "QRhi: newFallbackSurface() failed, trying manual creation";
-        delete sFallbackSurface;
-
-        // Use default format (most compatible)
-        sFallbackSurface = new QOffscreenSurface();
+        sFallbackSurface = std::make_unique<QOffscreenSurface>();
         sFallbackSurface->setFormat( QSurfaceFormat::defaultFormat() );
         sFallbackSurface->create();
 
         if ( !sFallbackSurface->isValid() )
         {
           qWarning() << "QRhi: Failed to create OpenGL offscreen surface";
-          delete sFallbackSurface;
-          sFallbackSurface = nullptr;
+          sFallbackSurface.reset();
           return nullptr;
         }
       }
-      QgsDebugMsgLevel( QStringLiteral( "QRhi: Created OpenGL offscreen surface" ), 2 );
+      QgsDebugMsgLevel( u"QRhi: Created OpenGL offscreen surface"_s, 2 );
     }
 
     QRhiGles2InitParams glesParams;
-    glesParams.fallbackSurface = sFallbackSurface;
+    glesParams.fallbackSurface = sFallbackSurface.get();
     rhi.reset( QRhi::create( QRhi::OpenGLES2, &glesParams, flags ) );
     if ( rhi )
     {
-      QgsDebugMsgLevel( QStringLiteral( "QRhi: Initialized with OpenGL ES 2 backend" ), 2 );
+      QgsDebugMsgLevel( u"QRhi: Initialized with OpenGL ES 2 backend"_s, 2 );
       return rhi;
     }
 
@@ -315,12 +320,184 @@ namespace
           }
         }
       }
-      // For other renderer types (pseudocolor, etc.), fall back to CPU rendering
+      // Check for single-band pseudocolor renderer
+      else if ( QgsSingleBandPseudoColorRenderer *pcRenderer = dynamic_cast<QgsSingleBandPseudoColorRenderer *>( rasterRenderer ) )
+      {
+        const int band = pcRenderer->inputBand();
+        if ( band > 0 )
+        {
+          gpuRenderer.setInputBand( band );
+
+          // Extract color ramp shader
+          QgsRasterShader *shader = pcRenderer->shader();
+          if ( shader )
+          {
+            QgsColorRampShader *rampShader = dynamic_cast<QgsColorRampShader *>( shader->rasterShaderFunction() );
+            if ( rampShader )
+            {
+              const QList<QgsColorRampShader::ColorRampItem> items = rampShader->colorRampItemList();
+              if ( !items.isEmpty() )
+              {
+                // Get min/max values from shader
+                const double minValue = rampShader->minimumValue();
+                const double maxValue = rampShader->maximumValue();
+
+                // Build 256-entry colormap from color ramp
+                QByteArray colormapData( 256 * 4, 0 );
+                const Qgis::ShaderInterpolationMethod interpType = rampShader->colorRampType();
+
+                for ( int i = 0; i < 256; ++i )
+                {
+                  // Map index to value in [minValue, maxValue] range
+                  const double value = minValue + ( static_cast<double>( i ) / 255.0 ) * ( maxValue - minValue );
+
+                  // Use QgsColorRampShader to shade the value
+                  int r = 0, g = 0, b = 0, a = 255;
+                  if ( rampShader->shade( value, &r, &g, &b, &a ) )
+                  {
+                    colormapData[i * 4 + 0] = static_cast<char>( r );
+                    colormapData[i * 4 + 1] = static_cast<char>( g );
+                    colormapData[i * 4 + 2] = static_cast<char>( b );
+                    colormapData[i * 4 + 3] = static_cast<char>( a );
+                  }
+                  // else: out of range stays transparent (already zeroed by QByteArray init)
+                }
+
+                gpuRenderer.setPseudocolorColormap( colormapData, minValue, maxValue, static_cast<int>( interpType ) );
+                QgsDebugMsgLevel( u"GPU rendering pseudocolor band=%1, min=%2, max=%3, items=%4, interp=%5"_s.arg( band ).arg( minValue ).arg( maxValue ).arg( items.size() ).arg( static_cast<int>( interpType ) ), 3 );
+              }
+              else
+              {
+                QgsDebugMsgLevel( u"GPU rendering skipped: empty color ramp"_s, 3 );
+                return false;
+              }
+            }
+            else
+            {
+              QgsDebugMsgLevel( u"GPU rendering skipped: no color ramp shader"_s, 3 );
+              return false;
+            }
+          }
+          else
+          {
+            QgsDebugMsgLevel( u"GPU rendering skipped: no raster shader"_s, 3 );
+            return false;
+          }
+        }
+      }
+      // Check for paletted raster renderer
+      else if ( QgsPalettedRasterRenderer *palettedRenderer = dynamic_cast<QgsPalettedRasterRenderer *>( rasterRenderer ) )
+      {
+        const int band = palettedRenderer->inputBand();
+        if ( band > 0 )
+        {
+          gpuRenderer.setInputBand( band );
+
+          // Extract color classes and build LUT
+          const QgsPalettedRasterRenderer::ClassData classes = palettedRenderer->classes();
+          if ( !classes.isEmpty() )
+          {
+            // Find min/max values for normalization
+            double minValue = std::numeric_limits<double>::max();
+            double maxValue = std::numeric_limits<double>::lowest();
+            for ( const auto &cls : classes )
+            {
+              minValue = std::min( minValue, cls.value );
+              maxValue = std::max( maxValue, cls.value );
+            }
+
+            // Build 256-entry colormap from paletted classes
+            // For paletted data, we use exact matching (discrete colors)
+            QByteArray colormapData( 256 * 4, 0 );
+
+            // Create a map for quick lookup
+            QMap<int, QColor> colorMap;
+            for ( const auto &cls : classes )
+            {
+              colorMap[static_cast<int>( cls.value )] = cls.color;
+            }
+
+            // Fill colormap - for byte data, index directly corresponds to value
+            for ( int i = 0; i < 256; ++i )
+            {
+              if ( colorMap.contains( i ) )
+              {
+                const QColor &color = colorMap[i];
+                colormapData[i * 4 + 0] = static_cast<char>( color.red() );
+                colormapData[i * 4 + 1] = static_cast<char>( color.green() );
+                colormapData[i * 4 + 2] = static_cast<char>( color.blue() );
+                colormapData[i * 4 + 3] = static_cast<char>( color.alpha() );
+              }
+              // Else leave as transparent (0,0,0,0)
+            }
+
+            gpuRenderer.setPseudocolorColormap( colormapData, 0.0, 255.0, 1 ); // Discrete
+            QgsDebugMsgLevel( u"GPU rendering paletted band=%1, classes=%2"_s.arg( band ).arg( classes.size() ), 3 );
+          }
+          else
+          {
+            QgsDebugMsgLevel( u"GPU rendering skipped: empty paletted classes"_s, 3 );
+            return false;
+          }
+        }
+      }
+      // Hillshade renderer - requires 3x3 kernel sampling, complex for tile-based GPU
+      // Falls back to CPU for now (could be GPU-accelerated with compute shader)
+      // Contour renderer - not GPU parallelizable (sequential line tracing, vector output)
+      // For other renderer types, fall back to CPU rendering
       else
       {
         QgsDebugMsgLevel( u"GPU rendering skipped: unsupported renderer type %1"_s.arg( rasterRenderer->type() ), 3 );
         return false;
       }
+    }
+
+    // CPU fallback: projector not supported on GPU
+    if ( pipe->projector() )
+    {
+      QgsDebugMsgLevel( u"GPU rendering skipped: reprojection required"_s, 3 );
+      return false;
+    }
+
+    // CPU fallback: custom nuller not supported on GPU
+    if ( pipe->nuller() )
+    {
+      QgsDebugMsgLevel( u"GPU rendering skipped: raster nuller active"_s, 3 );
+      return false;
+    }
+
+    // Extract brightness/contrast/gamma filter settings
+    if ( QgsBrightnessContrastFilter *bcFilter = pipe->brightnessFilter() )
+    {
+      if ( bcFilter->brightness() != 0 || bcFilter->contrast() != 0 || bcFilter->gamma() != 1.0 )
+      {
+        gpuRenderer.setBrightnessContrastGamma( bcFilter->brightness(), bcFilter->contrast(), bcFilter->gamma() );
+        QgsDebugMsgLevel( u"GPU rendering with brightness=%1, contrast=%2, gamma=%3"_s.arg( bcFilter->brightness() ).arg( bcFilter->contrast() ).arg( bcFilter->gamma() ), 3 );
+      }
+    }
+
+    // Extract hue/saturation filter settings
+    if ( QgsHueSaturationFilter *hsFilter = pipe->hueSaturationFilter() )
+    {
+      if ( hsFilter->invertColors() || hsFilter->saturation() != 0 || hsFilter->grayscaleMode() != QgsHueSaturationFilter::GrayscaleOff || hsFilter->colorizeOn() )
+      {
+        gpuRenderer.setHueSaturationFilter(
+          hsFilter->invertColors(),
+          static_cast<int>( hsFilter->grayscaleMode() ),
+          hsFilter->saturation(),
+          hsFilter->colorizeOn(),
+          hsFilter->colorizeColor(),
+          hsFilter->colorizeStrength()
+        );
+        QgsDebugMsgLevel( u"GPU rendering with invert=%1, grayscale=%2, saturation=%3, colorize=%4"_s.arg( hsFilter->invertColors() ).arg( static_cast<int>( hsFilter->grayscaleMode() ) ).arg( hsFilter->saturation() ).arg( hsFilter->colorizeOn() ), 3 );
+      }
+    }
+
+    // Extract renderer opacity (layer-level transparency)
+    if ( rasterRenderer && rasterRenderer->opacity() < 1.0 )
+    {
+      gpuRenderer.setOpacity( rasterRenderer->opacity() );
+      QgsDebugMsgLevel( u"GPU rendering with opacity=%1"_s.arg( rasterRenderer->opacity() ), 3 );
     }
 
     // Attempt GPU rendering
@@ -351,7 +528,7 @@ QRhi *QgsRasterGPUFactory::rhi()
 void QgsRasterGPUFactory::initialize()
 {
 #ifdef HAVE_QRHI
-  QgsDebugMsgLevel( QStringLiteral( "Initializing GPU raster rendering support (QRhi)" ), 2 );
+  QgsDebugMsgLevel( u"Initializing GPU raster rendering support (QRhi)"_s, 2 );
 
   // Record the thread that owns the GPU context
   sGpuThread = QThread::currentThread();
@@ -361,7 +538,7 @@ void QgsRasterGPUFactory::initialize()
 
   if ( !sRhi )
   {
-    QgsDebugError( QStringLiteral( "Failed to create QRhi - GPU rendering disabled" ) );
+    QgsDebugError( u"Failed to create QRhi - GPU rendering disabled"_s );
     sGpuThread = nullptr;
     return;
   }
@@ -369,26 +546,16 @@ void QgsRasterGPUFactory::initialize()
   // Register the GPU renderer factory
   QgsRasterLayerRenderer::setGpuRendererFactory( gpuRendererFactoryImpl );
 
-  // Connect to project layer removal to clean up GPU caches
-  QObject::connect( QgsProject::instance(), &QgsProject::layersRemoved, []( const QStringList &layerIds ) {
-    Q_UNUSED( layerIds )
-    // When layers are removed, we can't easily map layer IDs to data source URIs,
-    // so we rely on LRU eviction during rendering. For explicit cleanup,
-    // users can call QgsRasterGPUCacheManager::clearAll() during shutdown.
-    // Future enhancement: track layer ID -> URI mapping for targeted cleanup.
-    QgsDebugMsgLevel( QStringLiteral( "Layers removed, GPU cache will be evicted via LRU" ), 3 );
-  } );
-
-  QgsDebugMsgLevel( QStringLiteral( "GPU raster rendering support enabled (backend: %1)" ).arg( QString::fromLatin1( sRhi->backendName() ) ), 2 );
+  QgsDebugMsgLevel( u"GPU raster rendering support enabled (backend: %1)"_s.arg( QString::fromLatin1( sRhi->backendName() ) ), 2 );
 #else
-  QgsDebugMsgLevel( QStringLiteral( "GPU raster rendering not available (HAVE_QRHI not defined)" ), 2 );
+  QgsDebugMsgLevel( u"GPU raster rendering not available (HAVE_QRHI not defined)"_s, 2 );
 #endif
 }
 
 void QgsRasterGPUFactory::cleanup()
 {
 #ifdef HAVE_QRHI
-  QgsDebugMsgLevel( QStringLiteral( "Cleaning up GPU raster rendering support" ), 2 );
+  QgsDebugMsgLevel( u"Cleaning up GPU raster rendering support"_s, 2 );
 
   // Clear and delete the cache manager singleton (releases GPU resources)
   QgsRasterGPUCacheManager::cleanup();
@@ -398,6 +565,9 @@ void QgsRasterGPUFactory::cleanup()
 
   // Release QRhi (releases all GPU resources)
   sRhi.reset();
+
+  // Release OpenGL fallback surface
+  sFallbackSurface.reset();
 
   // Clear thread ownership
   sGpuThread = nullptr;

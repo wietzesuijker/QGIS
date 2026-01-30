@@ -23,6 +23,9 @@
 #include "qgsrastertilereader.h"
 
 #include <QMutexLocker>
+#include <QString>
+
+using namespace Qt::StringLiterals;
 
 QgsRasterGPUCacheManager *QgsRasterGPUCacheManager::sInstance = nullptr;
 
@@ -56,7 +59,7 @@ void QgsRasterGPUCacheManager::cleanup()
   {
     sInstance->clearAll();
     sInstance = nullptr;
-    QgsDebugMsgLevel( QStringLiteral( "GPU cache manager: singleton cleaned up" ), 2 );
+    QgsDebugMsgLevel( u"GPU cache manager: singleton cleaned up"_s, 2 );
   }
 }
 
@@ -81,7 +84,7 @@ QgsRasterGPUTileUploader *QgsRasterGPUCacheManager::getOrCreateUploader( const Q
   QRhi *rhi = QgsRasterGPUFactory::rhi();
   if ( !rhi )
   {
-    QgsDebugMsgLevel( QStringLiteral( "GPU cache: no QRhi context available" ), 4 );
+    QgsDebugMsgLevel( u"GPU cache: no QRhi context available"_s, 4 );
     return nullptr;
   }
 
@@ -95,7 +98,7 @@ QgsRasterGPUTileUploader *QgsRasterGPUCacheManager::getOrCreateUploader( const Q
   GDALDatasetH gdalDataset = GDALOpen( dataSourceUri.toUtf8().constData(), GA_ReadOnly );
   if ( !gdalDataset )
   {
-    QgsDebugMsgLevel( QStringLiteral( "GPU cache: cannot open GDAL dataset: %1" ).arg( dataSourceUri ), 4 );
+    QgsDebugMsgLevel( u"GPU cache: cannot open GDAL dataset: %1"_s.arg( dataSourceUri ), 4 );
     return nullptr;
   }
 
@@ -104,7 +107,7 @@ QgsRasterGPUTileUploader *QgsRasterGPUCacheManager::getOrCreateUploader( const Q
 
   if ( !reader->isValid() )
   {
-    QgsDebugMsgLevel( QStringLiteral( "GPU cache: tile reader initialization failed" ), 4 );
+    QgsDebugMsgLevel( u"GPU cache: tile reader initialization failed"_s, 4 );
     GDALClose( gdalDataset );
     return nullptr;
   }
@@ -123,14 +126,14 @@ QgsRasterGPUTileUploader *QgsRasterGPUCacheManager::getOrCreateUploader( const Q
 
   if ( !tileInfo.isTiled && !isZarrDataset )
   {
-    QgsDebugMsgLevel( QStringLiteral( "GPU cache: dataset is not tiled" ), 4 );
+    QgsDebugMsgLevel( u"GPU cache: dataset is not tiled"_s, 4 );
     GDALClose( gdalDataset );
     return nullptr;
   }
 
   if ( isZarrDataset )
   {
-    QgsDebugMsgLevel( QStringLiteral( "GPU cache: Zarr dataset detected" ), 3 );
+    QgsDebugMsgLevel( u"GPU cache: Zarr dataset detected"_s, 3 );
   }
 
   // Create uploader with QRhi
@@ -145,7 +148,7 @@ QgsRasterGPUTileUploader *QgsRasterGPUCacheManager::getOrCreateUploader( const Q
   QgsRasterGPUTileUploader *result = entry->uploader.get();
   mCache.emplace( dataSourceUri, std::move( entry ) );
 
-  QgsDebugMsgLevel( QStringLiteral( "GPU cache: created uploader for %1" ).arg( dataSourceUri ), 2 );
+  QgsDebugMsgLevel( u"GPU cache: created uploader for %1"_s.arg( dataSourceUri ), 2 );
 
   return result;
 #else
@@ -169,7 +172,7 @@ void QgsRasterGPUCacheManager::removeUploader( const QString &dataSourceUri )
     }
 #endif
     mCache.erase( it );
-    QgsDebugMsgLevel( QStringLiteral( "GPU cache: removed uploader for %1" ).arg( dataSourceUri ), 2 );
+    QgsDebugMsgLevel( u"GPU cache: removed uploader for %1"_s.arg( dataSourceUri ), 2 );
   }
 }
 
@@ -189,7 +192,7 @@ void QgsRasterGPUCacheManager::clearAll()
 #endif
 
   mCache.clear();
-  QgsDebugMsgLevel( QStringLiteral( "GPU cache: cleared all uploaders" ), 2 );
+  QgsDebugMsgLevel( u"GPU cache: cleared all uploaders"_s, 2 );
 }
 
 int QgsRasterGPUCacheManager::cacheSize() const

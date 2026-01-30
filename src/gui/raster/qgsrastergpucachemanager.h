@@ -19,7 +19,6 @@
 #define SIP_NO_FILE
 
 #include <gdal.h>
-
 #include <memory>
 #include <unordered_map>
 

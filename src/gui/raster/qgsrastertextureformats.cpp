@@ -18,6 +18,9 @@
 #include "qgslogger.h"
 
 #include <QOpenGLContext>
+#include <QString>
+
+using namespace Qt::StringLiterals;
 
 QHash<QPair<Qgis::DataType, int>, QgsRasterTextureFormats::FormatInfo> QgsRasterTextureFormats::sFormatTable;
 bool QgsRasterTextureFormats::sInitialized = false;
@@ -31,13 +34,13 @@ void QgsRasterTextureFormats::initializeFormats()
 
   // Byte (8-bit unsigned)
   sFormatTable[{ Qgis::DataType::Byte, 1 }] = {
-    GL_R8,                  // internal format
-    GL_RED,                 // format
-    GL_UNSIGNED_BYTE,       // type
-    1,                      // bytes per pixel
-    1,                      // channel count
-    QStringLiteral( "u8" ), // shader type
-    true                    // supported
+    GL_R8,            // internal format
+    GL_RED,           // format
+    GL_UNSIGNED_BYTE, // type
+    1,                // bytes per pixel
+    1,                // channel count
+    u"u8"_s,          // shader type
+    true              // supported
   };
 
   // UInt16 (16-bit unsigned)
@@ -47,7 +50,7 @@ void QgsRasterTextureFormats::initializeFormats()
     GL_UNSIGNED_SHORT,
     2,
     1,
-    QStringLiteral( "u16" ),
+    u"u16"_s,
     true
   };
 
@@ -58,7 +61,7 @@ void QgsRasterTextureFormats::initializeFormats()
     GL_SHORT,
     2,
     1,
-    QStringLiteral( "i16" ),
+    u"i16"_s,
     true
   };
 
@@ -69,7 +72,7 @@ void QgsRasterTextureFormats::initializeFormats()
     GL_FLOAT,
     4,
     1,
-    QStringLiteral( "f32" ),
+    u"f32"_s,
     true
   };
 
@@ -80,7 +83,7 @@ void QgsRasterTextureFormats::initializeFormats()
     GL_FLOAT,
     4, // Note: CPU data is 8 bytes, but we convert to 4 for GPU
     1,
-    QStringLiteral( "f32" ),
+    u"f32"_s,
     true
   };
 
@@ -93,7 +96,7 @@ void QgsRasterTextureFormats::initializeFormats()
     GL_UNSIGNED_BYTE,
     3,
     3,
-    QStringLiteral( "rgb8" ),
+    u"rgb8"_s,
     true
   };
 
@@ -104,7 +107,7 @@ void QgsRasterTextureFormats::initializeFormats()
     GL_UNSIGNED_BYTE,
     4,
     4,
-    QStringLiteral( "rgba8" ),
+    u"rgba8"_s,
     true
   };
 
@@ -115,7 +118,7 @@ void QgsRasterTextureFormats::initializeFormats()
     GL_UNSIGNED_SHORT,
     8,
     4,
-    QStringLiteral( "rgba16" ),
+    u"rgba16"_s,
     true
   };
 
@@ -126,13 +129,13 @@ void QgsRasterTextureFormats::initializeFormats()
     GL_FLOAT,
     16,
     4,
-    QStringLiteral( "rgba32f" ),
+    u"rgba32f"_s,
     true
   };
 
   sInitialized = true;
 
-  QgsDebugMsgLevel( QStringLiteral( "Initialized %1 texture formats" ).arg( sFormatTable.size() ), 2 );
+  QgsDebugMsgLevel( u"Initialized %1 texture formats"_s.arg( sFormatTable.size() ), 2 );
 }
 
 QgsRasterTextureFormats::FormatInfo QgsRasterTextureFormats::getFormat( Qgis::DataType dataType, int channelCount )
@@ -146,7 +149,7 @@ QgsRasterTextureFormats::FormatInfo QgsRasterTextureFormats::getFormat( Qgis::Da
     // Warn about Float64 → Float32 precision loss
     if ( dataType == Qgis::DataType::Float64 )
     {
-      QgsDebugMsgLevel( QStringLiteral( "Float64 raster data will be downcast to Float32 for GPU rendering (precision loss)" ), 2 );
+      QgsDebugMsgLevel( u"Float64 raster data will be downcast to Float32 for GPU rendering (precision loss)"_s, 2 );
     }
     return sFormatTable.value( key );
   }
@@ -157,13 +160,13 @@ QgsRasterTextureFormats::FormatInfo QgsRasterTextureFormats::getFormat( Qgis::Da
     const QPair<Qgis::DataType, int> fallbackKey( dataType, 1 );
     if ( sFormatTable.contains( fallbackKey ) )
     {
-      QgsDebugMsgLevel( QStringLiteral( "Using single-channel format for multi-channel %1" ).arg( channelCount ), 2 );
+      QgsDebugMsgLevel( u"Using single-channel format for multi-channel %1"_s.arg( channelCount ), 2 );
       return sFormatTable.value( fallbackKey );
     }
   }
 
   // Default fallback: R8
-  QgsDebugError( QStringLiteral( "No texture format for dataType=%1, channels=%2, using R8 fallback" )
+  QgsDebugError( u"No texture format for dataType=%1, channels=%2, using R8 fallback"_s
                    .arg( static_cast<int>( dataType ) )
                    .arg( channelCount ) );
 
@@ -173,7 +176,7 @@ QgsRasterTextureFormats::FormatInfo QgsRasterTextureFormats::getFormat( Qgis::Da
   fallback.type = GL_UNSIGNED_BYTE;
   fallback.bytesPerPixel = 1;
   fallback.channelCount = 1;
-  fallback.shaderType = QStringLiteral( "u8" );
+  fallback.shaderType = u"u8"_s;
   fallback.isSupported = false; // Mark as unsupported to warn user
 
   return fallback;

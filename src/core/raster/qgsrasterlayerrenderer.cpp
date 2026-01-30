@@ -515,7 +515,7 @@ QgsRasterLayerRenderer::QgsRasterLayerRenderer( QgsRasterLayer *layer, QgsRender
   if ( sGpuRendererFactory )
   {
     QgsRasterDataProvider *provider = layer->dataProvider();
-    if ( provider && provider->name() == QLatin1String( "gdal" ) )
+    if ( provider && provider->name() == "gdal"_L1 )
     {
       // Check if same CRS (no reprojection)
       if ( mRasterViewPort && mRasterViewPort->mSrcCRS == mRasterViewPort->mDestCRS )

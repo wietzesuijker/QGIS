@@ -92,6 +92,7 @@ add_qgis_test(testqgsrasterlayersaveasdialog.cpp MODULE gui LINKEDLIBRARIES qgis
 add_qgis_test(testqgslistwidget.cpp MODULE gui LINKEDLIBRARIES qgis_gui qgis_analysis)
 add_qgis_test(testqgsrastergpu.cpp MODULE gui LINKEDLIBRARIES qgis_gui qgis_core)
 add_qgis_test(testqgsrastergpubenchmark.cpp MODULE gui LINKEDLIBRARIES qgis_gui qgis_core)
+add_qgis_test(testqgsrastergpuparity.cpp MODULE gui LINKEDLIBRARIES qgis_gui qgis_core)
 
 if (ENABLE_PGTEST)
   SET_TESTS_PROPERTIES(

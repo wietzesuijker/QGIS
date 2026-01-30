@@ -4,12 +4,12 @@
   Tests tile reading + simulated GPU upload timing
  ***************************************************************************/
 
-#include <iostream>
-#include <vector>
 #include <chrono>
 #include <cstring>
 #include <gdal.h>
 #include <gdal_priv.h>
+#include <iostream>
+#include <vector>
 
 using namespace std::chrono;
 

@@ -22,6 +22,8 @@
 
 #include "qgis_gui.h"
 
+#include <QColor>
+
 #ifdef HAVE_QRHI
 #include <rhi/qrhi.h>
 #endif
@@ -167,6 +169,74 @@ class GUI_EXPORT QgsRasterGPURenderer
      */
     void setNoDataTolerance( double tolerance ) { mNoDataTolerance = tolerance; }
 
+    /**
+     * Set brightness/contrast/gamma filter parameters.
+     * These match the QgsBrightnessContrastFilter pipeline stage.
+     *
+     * Formulas (matching CPU implementation):
+     *
+     * - contrastFactor = pow((contrast+100)/100, 2)
+     * - gammaCorrection = 1/gamma
+     *
+     * \param brightness Brightness adjustment (-255 to 255)
+     * \param contrast Contrast adjustment (-100 to 100)
+     * \param gamma Gamma correction (0.1 to 10.0)
+     */
+    void setBrightnessContrastGamma( int brightness, int contrast, double gamma );
+
+    /**
+     * Set hue/saturation filter parameters.
+     * These match the QgsHueSaturationFilter pipeline stage.
+     *
+     * Processing order: Invert → Grayscale/Saturation → Colorize
+     *
+     * \param invert Whether to invert colors (1 - RGB)
+     * \param grayscaleMode 0=off, 1=lightness, 2=luminosity, 3=average
+     * \param saturation Saturation adjustment (-100 to 100)
+     * \param colorizeOn Whether colorization is enabled
+     * \param colorizeColor Color to use for colorization
+     * \param colorizeStrength Colorization blend strength (0-100)
+     */
+    void setHueSaturationFilter( bool invert, int grayscaleMode, int saturation, bool colorizeOn, const QColor &colorizeColor, int colorizeStrength );
+
+    /**
+     * Set custom colormap for pseudocolor rendering.
+     * The colormap is a 256-entry lookup table with RGBA values.
+     * Each entry is 4 bytes: R, G, B, A (0-255).
+     *
+     * \param colormapData 256 * 4 = 1024 bytes of RGBA data
+     * \param minValue Minimum value for normalization
+     * \param maxValue Maximum value for normalization
+     * \param interpolationType 0=Linear, 1=Discrete, 2=Exact
+     */
+    void setPseudocolorColormap( const QByteArray &colormapData, double minValue, double maxValue, int interpolationType = 0 );
+
+    /**
+     * Returns TRUE if pseudocolor mode is enabled (has custom colormap).
+     */
+    bool isPseudocolorMode() const { return mHasPseudocolorColormap; }
+
+    /**
+     * Set hillshade rendering parameters.
+     * Enables hillshade mode which computes shaded relief from DEM data.
+     *
+     * The shader implements the Horn (1981) slope algorithm using a 3x3 window:
+     *
+     * - X derivative: ((z13+z23+z23+z33)-(z11+z21+z21+z31))/(8*cellX)
+     * - Y derivative: ((z31+z32+z32+z33)-(z11+z12+z12+z13))/(8*cellY)
+     *
+     * \param azimuth Sun azimuth angle in degrees (0-360, 315=NW typical)
+     * \param altitude Sun altitude angle in degrees (0-90, 45 typical)
+     * \param zFactor Vertical exaggeration factor (default 1.0)
+     * \param multiDirectional Use multi-directional shading (4 azimuths)
+     */
+    void setHillshadeParams( double azimuth, double altitude, double zFactor, bool multiDirectional );
+
+    /**
+     * Returns TRUE if hillshade mode is enabled.
+     */
+    bool isHillshadeMode() const { return mHillshadeMode; }
+
   private:
     struct TileCoord
     {
@@ -264,6 +334,38 @@ class GUI_EXPORT QgsRasterGPURenderer
     double mNoDataB = 0.0;
     bool mHasPerBandNoData = false;
     double mNoDataTolerance = 0.5; // Default tolerance for integer data
+
+    // Brightness/Contrast/Gamma filter (from QgsBrightnessContrastFilter)
+    // Formula: contrastFactor = pow((contrast+100)/100, 2), gammaCorrection = 1/gamma
+    int mBrightness = 0; // -255 to 255
+    int mContrast = 0;   // -100 to 100
+    double mGamma = 1.0; // 0.1 to 10.0
+    bool mHasBrightnessFilter = false;
+
+    // Hue/Saturation filter (from QgsHueSaturationFilter)
+    // Order: Invert → Grayscale/Saturation → Colorize
+    bool mInvertColors = false;
+    int mGrayscaleMode = 0; // 0=off, 1=lightness, 2=luminosity, 3=average
+    int mSaturation = 0;    // -100 to 100
+    bool mColorizeOn = false;
+    QColor mColorizeColor;
+    int mColorizeStrength = 100; // 0 to 100
+    bool mHasHueSatFilter = false;
+
+    // Pseudocolor colormap (from QgsSingleBandPseudoColorRenderer)
+    QByteArray mPseudocolorData; // 256 * 4 bytes RGBA
+    double mPseudocolorMin = 0.0;
+    double mPseudocolorMax = 255.0;
+    int mPseudocolorInterpolationType = 0; // 0=Linear, 1=Discrete, 2=Exact
+    bool mHasPseudocolorColormap = false;
+
+    // Hillshade rendering (from QgsHillshadeRenderer)
+    // Uses Horn (1981) algorithm with pre-computed trigonometry
+    double mHillshadeAzimuth = 315.0;        // Sun azimuth (0-360, 315=NW)
+    double mHillshadeAltitude = 45.0;        // Sun altitude (0-90)
+    double mHillshadeZFactor = 1.0;          // Vertical exaggeration
+    bool mHillshadeMultiDirectional = false; // Multi-directional shading
+    bool mHillshadeMode = false;
 
     // Track if resources need recreation
     bool mPipelineNeedsRebuild = true;

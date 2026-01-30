@@ -31,7 +31,10 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QString>
 #include <QSurfaceFormat>
+
+using namespace Qt::StringLiterals;
 
 #ifdef HAVE_QRHI
 #include <rhi/qrhi.h>

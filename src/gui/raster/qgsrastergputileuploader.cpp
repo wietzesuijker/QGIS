@@ -15,9 +15,9 @@
 
 #include "qgsrastergputileuploader.h"
 
-#include "qgslogger.h"
-
 #include <limits>
+
+#include "qgslogger.h"
 
 #include <QMutexLocker>
 #include <QString>
@@ -90,7 +90,7 @@ QgsRasterGPUTileUploader::GPUTile QgsRasterGPUTileUploader::createTile( int over
   // Thread safety: QRhi resources can only be accessed from the owner thread
   if ( QThread::currentThread() != mOwnerThread )
   {
-    QgsDebugError( QStringLiteral( "createTile called from wrong thread" ) );
+    QgsDebugError( u"createTile called from wrong thread"_s );
     return result;
   }
 
@@ -152,7 +152,7 @@ QgsRasterGPUTileUploader::GPUTile QgsRasterGPUTileUploader::createRGBTile( int o
   // Thread safety: QRhi resources can only be accessed from the owner thread
   if ( QThread::currentThread() != mOwnerThread )
   {
-    QgsDebugError( QStringLiteral( "createRGBTile called from wrong thread" ) );
+    QgsDebugError( u"createRGBTile called from wrong thread"_s );
     return result;
   }
 

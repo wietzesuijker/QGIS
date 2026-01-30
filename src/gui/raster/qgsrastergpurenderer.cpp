@@ -15,6 +15,8 @@
 
 #include "qgsrastergpurenderer.h"
 
+#include <QString>
+
 #ifdef HAVE_QRHI
 
 #include <cmath>
@@ -51,6 +53,15 @@ using namespace Qt::StringLiterals;
 // 1 = StretchToMinimumMaximum (linear stretch, saturate at bounds)
 // 2 = ClipToMinimumMaximum (discard pixels outside range)
 // 3 = StretchAndClipToMinimumMaximum (clip then stretch)
+//
+// Brightness/Contrast/Gamma formulas (match QgsBrightnessContrastFilter):
+// - contrastFactor = pow((contrast+100)/100, 2)
+// - gammaCorrection = 1/gamma
+//
+// Hue/Saturation formulas (match QgsHueSaturationFilter):
+// - saturationScale = (saturation/100)+1, range 0-2
+// - Luminosity weights: 0.21R + 0.72G + 0.07B
+// - Saturation boost: 1 - pow(1-s, scale^2)
 struct UniformBlock
 {
     float mvpMatrix[16]; // mat4 uMVPMatrix (64 bytes, offset 0)
@@ -70,8 +81,44 @@ struct UniformBlock
     float noDataG;         // Green NoData (4 bytes, offset 108)
     float noDataB;         // Blue NoData (4 bytes, offset 112)
     float noDataTolerance; // NoData comparison tolerance (4 bytes, offset 116)
-    float padding[2];      // Alignment to 16 bytes (8 bytes, offset 120)
-                           // Total: 128 bytes
+    float _pad1[2];        // Alignment (8 bytes, offset 120)
+                           // Subtotal: 128 bytes
+
+    // Brightness/Contrast/Gamma filter (offset 128)
+    float brightness;      // -255 to 255 (4 bytes, offset 128)
+    float contrastFactor;  // pow((contrast+100)/100, 2) (4 bytes, offset 132)
+    float gammaCorrection; // 1/gamma (4 bytes, offset 136)
+    float _pad2;           // Alignment (4 bytes, offset 140)
+
+    // Hue/Saturation filter (offset 144)
+    float invertColors;     // 0 or 1 (4 bytes, offset 144)
+    float grayscaleMode;    // 0=off, 1=lightness, 2=luminosity, 3=average (4 bytes, offset 148)
+    float saturationScale;  // (saturation/100)+1, range 0-2 (4 bytes, offset 152)
+    float colorizeOn;       // 0 or 1 (4 bytes, offset 156)
+    float colorizeH;        // 0-1 hue (4 bytes, offset 160)
+    float colorizeS;        // 0-1 saturation (4 bytes, offset 164)
+    float colorizeStrength; // 0-1 strength (4 bytes, offset 168)
+    float _pad3;            // Alignment (4 bytes, offset 172)
+
+    // Filter enable flags (offset 176)
+    float useBrightnessFilter; // 1 if filter active (4 bytes, offset 176)
+    float useHueSatFilter;     // 1 if filter active (4 bytes, offset 180)
+
+    // Hillshade parameters (offset 184)
+    float hillshadeMode;     // 1 if hillshade rendering (4 bytes, offset 184)
+    float hillshadeAzimuth;  // Sun azimuth in radians (4 bytes, offset 188)
+    float hillshadeAltitude; // Sun altitude in radians (4 bytes, offset 192)
+    float hillshadeZFactor;  // Z exaggeration (4 bytes, offset 196)
+    float hillshadeMultiDir; // Multi-directional flag (4 bytes, offset 200)
+    // Pre-computed trig values for efficiency
+    float cosAzCosAlt; // cos(az) * cos(alt) (4 bytes, offset 204)
+    float sinAzCosAlt; // sin(az) * cos(alt) (4 bytes, offset 208)
+    float sinAlt;      // sin(alt) (4 bytes, offset 212)
+    float cellSizeX;   // Cell width for derivative (4 bytes, offset 216)
+    float cellSizeY;   // Cell height for derivative (4 bytes, offset 220)
+
+    float _reserved[8]; // Pad to 256 bytes (32 bytes, offset 224)
+                        // Total: 256 bytes
 };
 
 void QgsRasterGPURenderer::setRGBBands( int redBand, int greenBand, int blueBand )
@@ -113,6 +160,57 @@ void QgsRasterGPURenderer::setRGBNoData( double redNoData, double greenNoData, d
   mNoDataG = greenNoData;
   mNoDataB = blueNoData;
   mHasPerBandNoData = true;
+}
+
+void QgsRasterGPURenderer::setBrightnessContrastGamma( int brightness, int contrast, double gamma )
+{
+  mBrightness = std::clamp( brightness, -255, 255 );
+  mContrast = std::clamp( contrast, -100, 100 );
+  mGamma = std::clamp( gamma, 0.1, 10.0 );
+  mHasBrightnessFilter = true;
+}
+
+void QgsRasterGPURenderer::setHueSaturationFilter( bool invert, int grayscaleMode, int saturation, bool colorizeOn, const QColor &colorizeColor, int colorizeStrength )
+{
+  mInvertColors = invert;
+  mGrayscaleMode = std::clamp( grayscaleMode, 0, 3 );
+  mSaturation = std::clamp( saturation, -100, 100 );
+  mColorizeOn = colorizeOn;
+  mColorizeColor = colorizeColor;
+  mColorizeStrength = std::clamp( colorizeStrength, 0, 100 );
+  mHasHueSatFilter = true;
+}
+
+void QgsRasterGPURenderer::setPseudocolorColormap( const QByteArray &colormapData, double minValue, double maxValue, int interpolationType )
+{
+  if ( colormapData.size() != 256 * 4 )
+  {
+    QgsDebugError( u"Pseudocolor colormap must be 1024 bytes (256 RGBA entries), got %1"_s.arg( colormapData.size() ) );
+    return;
+  }
+  mPseudocolorData = colormapData;
+  mPseudocolorMin = minValue;
+  mPseudocolorMax = maxValue;
+  mPseudocolorInterpolationType = interpolationType;
+  mHasPseudocolorColormap = true;
+  mColormapUploaded = false; // Force colormap re-upload with new data
+
+  // Also set contrast enhancement to use pseudocolor min/max
+  mMinValue = minValue;
+  mMaxValue = maxValue;
+  mHasContrastEnhancement = true;
+}
+
+void QgsRasterGPURenderer::setHillshadeParams( double azimuth, double altitude, double zFactor, bool multiDirectional )
+{
+  mHillshadeAzimuth = azimuth;
+  mHillshadeAltitude = std::clamp( altitude, 0.0, 90.0 );
+  mHillshadeZFactor = zFactor;
+  mHillshadeMultiDirectional = multiDirectional;
+  mHillshadeMode = true;
+
+  // Hillshade doesn't use colormap texture - generate grayscale output directly
+  mColormapUploaded = false;
 }
 
 QgsRasterGPURenderer::QgsRasterGPURenderer( QgsRasterGPUTileUploader *tileUploader, QRhi *rhi )
@@ -554,6 +652,14 @@ bool QgsRasterGPURenderer::render( QgsRenderContext &renderContext, QgsRasterVie
     return false;
   }
 
+  // Validate tile count against vertex buffer capacity
+  constexpr int MAX_TILES = 256;
+  if ( tilesToRender.size() > MAX_TILES )
+  {
+    QgsDebugError( u"Too many tiles: %1 > %2, falling back"_s.arg( tilesToRender.size() ).arg( MAX_TILES ) );
+    return false;
+  }
+
   // Build vertex data for all tiles
   constexpr int FLOATS_PER_VERTEX = 4;
   constexpr int VERTICES_PER_TILE = 6;
@@ -587,8 +693,8 @@ bool QgsRasterGPURenderer::render( QgsRenderContext &renderContext, QgsRasterVie
   mvpMatrix.scale( scaleX, scaleY );
   mvpMatrix.translate( translateX, translateY );
 
-  // Prepare uniform data
-  UniformBlock uniforms;
+  // Prepare uniform data (aggregate init zeros all fields)
+  UniformBlock uniforms {};
   memcpy( uniforms.mvpMatrix, mvpMatrix.constData(), sizeof( uniforms.mvpMatrix ) );
 
   // Get data type info from tile uploader
@@ -690,8 +796,48 @@ bool QgsRasterGPURenderer::render( QgsRenderContext &renderContext, QgsRasterVie
     uniforms.noDataTolerance = static_cast<float>( mNoDataTolerance );
   }
 
-  uniforms.padding[0] = 0.0f;
-  uniforms.padding[1] = 0.0f;
+  // Brightness/Contrast/Gamma filter
+  // Formula: contrastFactor = pow((contrast+100)/100, 2), gammaCorrection = 1/gamma
+  if ( mHasBrightnessFilter )
+  {
+    uniforms.brightness = static_cast<float>( mBrightness );
+    uniforms.contrastFactor = static_cast<float>( std::pow( ( mContrast + 100 ) / 100.0, 2 ) );
+    uniforms.gammaCorrection = static_cast<float>( 1.0 / mGamma );
+    uniforms.useBrightnessFilter = 1.0f;
+  }
+  else
+  {
+    uniforms.brightness = 0.0f;
+    uniforms.contrastFactor = 1.0f;
+    uniforms.gammaCorrection = 1.0f;
+    uniforms.useBrightnessFilter = 0.0f;
+  }
+
+  // Hue/Saturation filter
+  // Order: Invert → Grayscale/Saturation → Colorize
+  if ( mHasHueSatFilter )
+  {
+    uniforms.invertColors = mInvertColors ? 1.0f : 0.0f;
+    uniforms.grayscaleMode = static_cast<float>( mGrayscaleMode );
+    uniforms.saturationScale = static_cast<float>( ( mSaturation / 100.0 ) + 1.0 );
+    uniforms.colorizeOn = mColorizeOn ? 1.0f : 0.0f;
+    uniforms.colorizeH = static_cast<float>( mColorizeColor.hueF() );
+    uniforms.colorizeS = static_cast<float>( mColorizeColor.saturationF() );
+    uniforms.colorizeStrength = static_cast<float>( mColorizeStrength / 100.0 );
+    uniforms.useHueSatFilter = 1.0f;
+  }
+  else
+  {
+    uniforms.invertColors = 0.0f;
+    uniforms.grayscaleMode = 0.0f;
+    uniforms.saturationScale = 1.0f;
+    uniforms.colorizeOn = 0.0f;
+    uniforms.colorizeH = 0.0f;
+    uniforms.colorizeS = 0.0f;
+    uniforms.colorizeStrength = 0.0f;
+    uniforms.useHueSatFilter = 0.0f;
+  }
+  // Note: Hillshade and reserved fields are already zeroed by aggregate init
 
   // Begin offscreen frame (enables synchronous readback)
   QRhiCommandBuffer *cb = nullptr;
@@ -716,17 +862,28 @@ bool QgsRasterGPURenderer::render( QgsRenderContext &renderContext, QgsRasterVie
   // Upload colormap texture once (single-band mode)
   if ( !mRGBMode && mColormapTexture && !mColormapUploaded )
   {
-    // Create grayscale colormap, respecting gradient direction
-    QByteArray colormapData( 256 * 4, 0 );
-    for ( int i = 0; i < 256; ++i )
+    QByteArray colormapData;
+
+    if ( mHasPseudocolorColormap && mPseudocolorData.size() == 256 * 4 )
     {
-      // Apply gradient inversion if WhiteToBlack
-      const int value = mInvertGradient ? ( 255 - i ) : i;
-      colormapData[i * 4 + 0] = static_cast<char>( value );
-      colormapData[i * 4 + 1] = static_cast<char>( value );
-      colormapData[i * 4 + 2] = static_cast<char>( value );
-      colormapData[i * 4 + 3] = static_cast<char>( 255 );
+      // Use pseudocolor colormap from QgsSingleBandPseudoColorRenderer
+      colormapData = mPseudocolorData;
     }
+    else
+    {
+      // Create grayscale colormap, respecting gradient direction
+      colormapData.resize( 256 * 4 );
+      for ( int i = 0; i < 256; ++i )
+      {
+        // Apply gradient inversion if WhiteToBlack
+        const int value = mInvertGradient ? ( 255 - i ) : i;
+        colormapData[i * 4 + 0] = static_cast<char>( value );
+        colormapData[i * 4 + 1] = static_cast<char>( value );
+        colormapData[i * 4 + 2] = static_cast<char>( value );
+        colormapData[i * 4 + 3] = static_cast<char>( 255 );
+      }
+    }
+
     QRhiTextureSubresourceUploadDescription colormapUpload( colormapData.constData(), colormapData.size() );
     uploadBatch->uploadTexture( mColormapTexture.get(), QRhiTextureUploadDescription( { { 0, 0, colormapUpload } } ) );
     mColormapUploaded = true;

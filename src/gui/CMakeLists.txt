@@ -705,7 +705,6 @@ set(QGIS_GUI_SRCS
   qgsmapcanvasannotationitem.cpp
   qgsmapcanvasitem.cpp
   qgsmapcanvasmap.cpp
-  qgsmapcanvasgpu.cpp
   qgsmapcanvassnappingutils.cpp
   qgsmapcanvastracer.cpp
   qgsmapcanvasutils.cpp
@@ -979,7 +978,6 @@ set(QGIS_GUI_HDRS
   qgsmapcanvasinteractionblocker.h
   qgsmapcanvasitem.h
   qgsmapcanvasmap.h
-  qgsmapcanvasgpu.h
   qgsmapcanvassnappingutils.h
   qgsmapcanvastracer.h
   qgsmapcanvasutils.h
