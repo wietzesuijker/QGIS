@@ -1,0 +1,4 @@
+# Build artifacts
+benchmark_gpu_upload
+*.o
+*.dSYM/

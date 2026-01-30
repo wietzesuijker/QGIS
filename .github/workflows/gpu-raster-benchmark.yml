@@ -1,0 +1,263 @@
+---
+# =============================================================================
+# GPU Raster Rendering Benchmark
+# =============================================================================
+#
+# PURPOSE:
+#   Validates GPU-accelerated raster rendering works cross-platform.
+#   Linux: Mesa llvmpipe software rendering (via xvfb-run)
+#   macOS: Metal GPU backend (M1 chip)
+#
+# =============================================================================
+
+name: 🚀 GPU Raster Benchmark
+
+on:
+  push:
+    branches:
+      - master
+      - release-**
+      - feat/fast-cog-reader
+      - feat/gpu-raster-qrhi
+    paths:
+      - 'src/gui/raster/qgsrastergpu*'
+      - 'src/gui/raster/shaders/**'
+      - 'src/gui/CMakeLists.txt'
+      - 'tests/src/gui/testqgsrastergpu*'
+      - '.github/workflows/gpu-raster-benchmark.yml'
+  pull_request:
+    paths:
+      - 'src/gui/raster/qgsrastergpu*'
+      - 'src/gui/raster/shaders/**'
+      - 'src/gui/CMakeLists.txt'
+      - 'tests/src/gui/testqgsrastergpu*'
+      - '.github/workflows/gpu-raster-benchmark.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # Linux Benchmark (Mesa llvmpipe software rendering)
+  # ===========================================================================
+  benchmark-linux:
+    name: 🐧 Linux Benchmark (Mesa)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🐣 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐳 Pull Pre-built Docker Image
+        run: |
+          docker pull qgis/qgis3-build-deps-ubuntu-qt6:master
+          docker tag qgis/qgis3-build-deps-ubuntu-qt6:master qgis3-build-deps
+
+      - name: 💾 Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-linux-gpu-${{ github.sha }}
+          restore-keys: ccache-linux-gpu-
+
+      - name: 📥 Download Test COG
+        run: |
+          curl -L -o /tmp/qgis-bench-cog.tif \
+            "https://s3.us-east-1.amazonaws.com/ds-deck.gl-raster-public/cog/Annual_NLCD_LndCov_2024_CU_C1V1.tif"
+          ls -lh /tmp/qgis-bench-cog.tif
+
+      - name: 🔨 Build and Run Benchmark
+        run: |
+          mkdir -p ~/.ccache
+          docker run -t --name qgis_build \
+            -v $(pwd):/root/QGIS \
+            -v ~/.ccache:/root/.ccache \
+            -v /tmp:/tmp \
+            -e CCACHE_DIR=/root/.ccache \
+            -e CCACHE_MAXSIZE=1G \
+            -e LIBGL_ALWAYS_SOFTWARE=1 \
+            -e MESA_GL_VERSION_OVERRIDE=3.3 \
+            -e GALLIUM_DRIVER=llvmpipe \
+            qgis3-build-deps \
+            bash -c "
+              set -e  # Exit on any error
+              git config --global --add safe.directory /root/QGIS
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                qt6-shadertools-dev qt6-base-private-dev libvulkan-dev \
+                xvfb mesa-utils
+
+              mkdir -p /root/QGIS/build && cd /root/QGIS/build
+              cmake .. -G Ninja \
+                -DWITH_GUI=ON -DWITH_DESKTOP=OFF -DWITH_3D=OFF \
+                -DWITH_QUICK=OFF -DWITH_BINDINGS=OFF -DWITH_SERVER=OFF \
+                -DWITH_GRASS=OFF -DWITH_PDAL=OFF \
+                -DWITH_INTERNAL_SPATIALINDEX=ON -DENABLE_TESTS=ON \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache
+
+              ninja test_gui_rastergpubenchmark
+
+              # Run benchmark using xvfb-run (same as QGIS CI)
+              echo '=== Running GPU benchmark with xvfb-run ==='
+              xvfb-run -a ./output/bin/test_gui_rastergpubenchmark 2>&1 | tee /tmp/benchmark.txt
+            "
+
+          echo "## 🐧 Linux Benchmark Results (Mesa llvmpipe)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if GPU actually worked (not just skipped)
+          if grep -q "GPU Backend:" /tmp/benchmark.txt; then
+            echo "✅ **GPU rendering validated**" >> $GITHUB_STEP_SUMMARY
+            grep "GPU Backend:" /tmp/benchmark.txt >> $GITHUB_STEP_SUMMARY
+          elif grep -q "skipped" /tmp/benchmark.txt; then
+            echo "❌ **GPU initialization failed - QRhi not available**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This means the OpenGL fallback didn't work in this environment." >> $GITHUB_STEP_SUMMARY
+            # Fail the build - we need GPU to work for this benchmark
+            exit 1
+          else
+            echo "ℹ️ Benchmark completed (check logs for details)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary>Full Output</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/benchmark.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+      - name: 📊 Upload Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-linux
+          path: /tmp/benchmark.txt
+          retention-days: 30
+
+  # ===========================================================================
+  # macOS Benchmark (Metal GPU)
+  # ===========================================================================
+  benchmark-macos:
+    name: 🍎 macOS Benchmark (Metal)
+    runs-on: macos-14
+
+    steps:
+      - name: 🐣 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🍺 Install Dependencies (Homebrew)
+        timeout-minutes: 20
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: |
+          # Core build tools (cmake/ninja already on runner, ccache for speed)
+          brew install ccache bison flex
+
+          # Qt6 (includes private headers for QRhi/Metal)
+          brew install qt@6
+
+          # QGIS core dependencies (minimal set for GPU benchmark)
+          # Note: NOT installing spatialindex - Homebrew has 2.1 but QGIS needs <2.1
+          # We'll use WITH_INTERNAL_SPATIALINDEX=ON instead
+          brew install gdal proj geos sqlite spatialite-tools \
+            libzip protobuf exiv2 qca qtkeychain gsl libpq qscintilla2 zstd
+
+          # Set up paths (bison/flex must override system versions)
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix flex)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix qt@6)/bin" >> $GITHUB_PATH
+          echo "Qt6_DIR=$(brew --prefix qt@6)/lib/cmake/Qt6" >> $GITHUB_ENV
+
+      - name: 📥 Download Test COG
+        run: |
+          curl -L -o /tmp/qgis-bench-cog.tif \
+            "https://s3.us-east-1.amazonaws.com/ds-deck.gl-raster-public/cog/Annual_NLCD_LndCov_2024_CU_C1V1.tif"
+          ls -lh /tmp/qgis-bench-cog.tif
+
+      - name: 🔨 Configure and Build
+        run: |
+          # Use Homebrew Qt6 (includes private headers for QRhi/Metal)
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix qca);$(brew --prefix qtkeychain);$(brew --prefix qscintilla2)" \
+            -DSQLITE3_INCLUDE_DIR="$(brew --prefix sqlite)/include" \
+            -DSQLITE3_LIBRARY="$(brew --prefix sqlite)/lib/libsqlite3.dylib" \
+            -DWITH_GUI=ON \
+            -DWITH_DESKTOP=OFF \
+            -DWITH_3D=OFF \
+            -DWITH_QUICK=OFF \
+            -DWITH_BINDINGS=OFF \
+            -DWITH_SERVER=OFF \
+            -DWITH_GRASS=OFF \
+            -DWITH_PDAL=OFF \
+            -DWITH_QTWEBENGINE=OFF \
+            -DWITH_DRACO=OFF \
+            -DWITH_QWTPOLAR=OFF \
+            -DWITH_INTERNAL_SPATIALINDEX=ON \
+            -DUSE_OPENCL=OFF \
+            -DENABLE_TESTS=ON
+
+          cmake --build build --target test_gui_rastergpubenchmark
+
+      - name: 🏃 Run GPU Benchmark
+        id: benchmark
+        run: |
+          cd build
+          # Debug: show what was built
+          echo "=== Contents of build/output/bin ==="
+          ls -la output/bin/ 2>/dev/null | head -20 || echo "output/bin not found"
+          echo "=== Looking for benchmark executable ==="
+          find . -name "*rastergpubenchmark*" -type f 2>/dev/null | head -10 || echo "No benchmark files found"
+
+          # Run the benchmark (macOS uses bundle structure: output/Contents/MacOS/)
+          BENCHMARK_PATH="output/Contents/MacOS/test_gui_rastergpubenchmark"
+          if [ -f "$BENCHMARK_PATH" ]; then
+            ./$BENCHMARK_PATH 2>&1 | tee /tmp/benchmark.txt
+          else
+            echo "ERROR: Benchmark executable not found at $BENCHMARK_PATH!" | tee /tmp/benchmark.txt
+            exit 1
+          fi
+
+          echo "## 🍎 macOS Benchmark Results (Metal)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if GPU actually worked (not just skipped)
+          if grep -q "GPU Backend:" /tmp/benchmark.txt; then
+            echo "✅ **GPU rendering validated**" >> $GITHUB_STEP_SUMMARY
+            grep "GPU Backend:" /tmp/benchmark.txt >> $GITHUB_STEP_SUMMARY
+          elif grep -q "skipped" /tmp/benchmark.txt; then
+            echo "❌ **GPU initialization failed - QRhi not available**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Metal or OpenGL fallback didn't work in this environment." >> $GITHUB_STEP_SUMMARY
+            # Fail the build - we need GPU to work for this benchmark
+            exit 1
+          else
+            echo "ℹ️ Benchmark completed (check logs for details)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary>Full Output</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/benchmark.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+      - name: 📊 Upload Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-macos
+          path: /tmp/benchmark.txt
+          retention-days: 30
