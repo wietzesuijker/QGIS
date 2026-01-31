@@ -58,7 +58,7 @@ jobs:
           docker pull qgis/qgis3-build-deps-ubuntu-qt6:master
           docker tag qgis/qgis3-build-deps-ubuntu-qt6:master qgis3-build-deps
 
-      - name: 💾 Restore ccache
+      - name: 💾 ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
@@ -153,6 +153,22 @@ jobs:
       - name: 🐣 Checkout
         uses: actions/checkout@v6
 
+      - name: 💾 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-macos-gpu-${{ github.sha }}
+          restore-keys: ccache-macos-gpu-
+
+      - name: 💾 Cache Homebrew packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /opt/homebrew/Cellar
+          key: homebrew-macos-gpu-${{ hashFiles('.github/workflows/gpu-raster-benchmark.yml') }}
+          restore-keys: homebrew-macos-gpu-
+
       - name: 🍺 Install Dependencies (Homebrew)
         timeout-minutes: 20
         env:
@@ -184,6 +200,9 @@ jobs:
           ls -lh /tmp/qgis-bench-cog.tif
 
       - name: 🔨 Configure and Build
+        env:
+          CCACHE_DIR: ~/Library/Caches/ccache
+          CCACHE_MAXSIZE: 1G
         run: |
           # Use Homebrew Qt6 (includes private headers for QRhi/Metal)
           cmake -S . -B build -G Ninja \
