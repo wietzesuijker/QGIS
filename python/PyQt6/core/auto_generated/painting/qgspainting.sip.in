@@ -147,6 +147,8 @@ avoid issues with incorrect scaling.
 
 .. versionadded:: 3.40
 %End
+
+
 };
 
 /************************************************************************

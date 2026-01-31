@@ -100,6 +100,17 @@ QgsRasterLayerRenderer::QgsRasterLayerRenderer( QgsRasterLayer *layer, QgsRender
 {
   mReadyToCompose = false;
 
+  // Check if we need to force raster rendering due to non-standard blend mode
+  // This is needed to work around Qt bug QTBUG-66590 where transparent pixels
+  // incorrectly affect the destination with non-SourceOver composition modes
+  if ( rendererContext.rasterizedRenderingPolicy() != Qgis::RasterizedRenderingPolicy::ForceVector )
+  {
+    if ( layer->blendMode() != QPainter::CompositionMode_SourceOver )
+    {
+      mForceRasterRenderForBlendMode = true;
+    }
+  }
+
   QElapsedTimer timer;
   timer.start();
 
@@ -658,6 +669,10 @@ bool QgsRasterLayerRenderer::forceRasterRender() const
 
   // preview of intermediate raster rendering results requires a temporary output image
   if ( renderContext()->testFlag( Qgis::RenderContextFlag::RenderPartialOutput ) )
+    return true;
+
+  // non-standard blend mode requires rasterization to work around Qt transparency bug
+  if ( mForceRasterRenderForBlendMode )
     return true;
 
   if ( QgsRasterRenderer *renderer = mPipe->renderer() )

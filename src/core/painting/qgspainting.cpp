@@ -259,3 +259,96 @@ void QgsPainting::drawPicture( QPainter *painter, const QPointF &point, const QP
   painter->drawPicture( QPointF( point.x() / xScale, point.y() / yScale ), picture );
   painter->scale( 1 / xScale, 1 / yScale );
 }
+
+void QgsPainting::restorePixelsWhereTransparent( QImage &dest, const QImage &backup,
+    const QImage &source )
+{
+  // Workaround for Qt bug QTBUG-66590:
+  // Non-SourceOver blend modes (Multiply, Screen, Overlay, etc.) incorrectly
+  // modify destination pixels even when source alpha is 0. For example:
+  //   - Multiply with transparent black (0,0,0,0) turns destination black
+  //   - Screen with transparent black turns destination black
+  // This function undoes the damage by restoring original destination pixels
+  // wherever the source was fully transparent.
+
+  Q_ASSERT_X( dest.depth() == 32 && backup.depth() == 32 && source.depth() == 32,
+              "restorePixelsWhereTransparent", "All images must be 32-bit ARGB" );
+  Q_ASSERT_X( dest.size() == backup.size() && dest.size() == source.size(),
+              "restorePixelsWhereTransparent", "All images must have same dimensions" );
+
+  const int width = source.width();
+  const int height = source.height();
+
+  for ( int y = 0; y < height; ++y )
+  {
+    QRgb *destLine = reinterpret_cast<QRgb *>( dest.scanLine( y ) );
+    const QRgb *backupLine = reinterpret_cast<const QRgb *>( backup.constScanLine( y ) );
+    const QRgb *srcLine = reinterpret_cast<const QRgb *>( source.constScanLine( y ) );
+
+    for ( int x = 0; x < width; ++x )
+    {
+      if ( qAlpha( srcLine[x] ) == 0 )
+      {
+        destLine[x] = backupLine[x];
+      }
+    }
+  }
+}
+
+void QgsPainting::drawImageWithBlendMode( QImage &dest, const QImage &source,
+    QPainter::CompositionMode mode, qreal opacity )
+{
+  // SourceOver (Normal) mode handles transparency correctly - no workaround needed
+  if ( mode == QPainter::CompositionMode_SourceOver )
+  {
+    QPainter painter( &dest );
+    painter.setCompositionMode( mode );
+    painter.setOpacity( opacity );
+    painter.drawImage( 0, 0, source );
+    return;
+  }
+
+  // For non-SourceOver modes, we must work around Qt bug QTBUG-66590:
+  // Qt applies blend formulas to ALL pixels, ignoring alpha. This causes
+  // transparent pixels to incorrectly modify the destination.
+  //
+  // Strategy:
+  //   1. Save destination before blending
+  //   2. Apply blend (Qt damages transparent regions)
+  //   3. Restore destination where source alpha = 0
+
+  const QRect region = QRect( QPoint( 0, 0 ), source.size() ).intersected( dest.rect() );
+  if ( region.isEmpty() )
+    return;
+
+  // Step 1: Save destination pixels that might be damaged
+  const QImage destBackup = dest.copy( region );
+
+  // Step 2: Apply blend mode (this incorrectly affects transparent regions)
+  {
+    QPainter painter( &dest );
+    painter.setCompositionMode( mode );
+    painter.setOpacity( opacity );
+    painter.drawImage( 0, 0, source );
+  }
+
+  // Step 3: Restore destination where source was transparent
+  // Note: For partial images, we work with the intersection region
+  const int width = region.width();
+  const int height = region.height();
+
+  for ( int y = 0; y < height; ++y )
+  {
+    QRgb *destLine = reinterpret_cast<QRgb *>( dest.scanLine( region.y() + y ) ) + region.x();
+    const QRgb *backupLine = reinterpret_cast<const QRgb *>( destBackup.constScanLine( y ) );
+    const QRgb *srcLine = reinterpret_cast<const QRgb *>( source.constScanLine( y ) );
+
+    for ( int x = 0; x < width; ++x )
+    {
+      if ( qAlpha( srcLine[x] ) == 0 )
+      {
+        destLine[x] = backupLine[x];
+      }
+    }
+  }
+}

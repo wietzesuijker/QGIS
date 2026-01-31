@@ -32,6 +32,8 @@ using namespace Qt::StringLiterals;
 #include <qgsproject.h>
 #include <qgsmultibandcolorrenderer.h>
 #include <qgsrasterlayer.h>
+#include <qgsmaprenderersequentialjob.h>
+#include <qgsrastertransparency.h>
 #include "qgsrasterdataprovider.h"
 
 /**
@@ -61,6 +63,7 @@ class TestQgsBlendModes : public QgsTest
     void featureBlending();
     void vectorLayerTransparency();
     void rasterBlending();
+    void rasterBlendingWithTransparency();
 
   private:
     QgsMapSettings *mMapSettings = nullptr;
@@ -202,6 +205,78 @@ void TestQgsBlendModes::rasterBlending()
   // set blending mode for top layer
   mRasterLayer1->setBlendMode( QPainter::CompositionMode_Difference );
   QGSVERIFYRENDERMAPSETTINGSCHECK( u"raster_blendmodes"_s, u"raster_blendmodes"_s, *mMapSettings, 20, 5 );
+}
+
+void TestQgsBlendModes::rasterBlendingWithTransparency()
+{
+  // Test for issue #55628: Blending-Modes Render No-Data Transparent Pixel Values
+  // This test verifies that raster layers with transparent pixels render correctly
+  // when using non-Normal blend modes. The bug was that transparent pixels would
+  // incorrectly affect the destination with non-SourceOver blend modes due to
+  // Qt bug QTBUG-66590.
+
+  // Use existing test raster with mask that has transparent areas
+  const QFileInfo rasterFileInfo( mTestDataDir + "raster/rgb_with_mask.tif" );
+  auto rasterLayer = std::make_unique<QgsRasterLayer>( rasterFileInfo.filePath(), u"masked_raster"_s );
+  QVERIFY( rasterLayer->isValid() );
+
+  // Set up map settings with a colored background
+  QgsMapSettings settings;
+  settings.setLayers( { rasterLayer.get() } );
+  settings.setExtent( rasterLayer->extent() );
+  settings.setOutputSize( QSize( 162, 150 ) );
+  settings.setOutputDpi( 96 );
+  const QColor backgroundColor( 255, 0, 0 ); // Red background
+  settings.setBackgroundColor( backgroundColor );
+
+  // First render with Normal mode to establish baseline
+  rasterLayer->setBlendMode( QPainter::CompositionMode_SourceOver );
+  QgsMapRendererSequentialJob normalJob( settings );
+  normalJob.start();
+  normalJob.waitForFinished();
+  const QImage normalImage = normalJob.renderedImage();
+  QVERIFY( !normalImage.isNull() );
+
+  // Find a corner pixel in the transparent region
+  // The test image has transparency around the edges
+  const QColor normalCorner = normalImage.pixelColor( 5, 5 );
+
+  // Verify corner shows background in Normal mode
+  QVERIFY2( normalCorner.red() >= 250 && normalCorner.green() <= 5 && normalCorner.blue() <= 5, qPrintable( u"Corner should show red background in Normal mode, got RGB(%1,%2,%3)"_s.arg( normalCorner.red() ).arg( normalCorner.green() ).arg( normalCorner.blue() ) ) );
+
+  // Test non-SourceOver blend modes - the fix ensures transparent pixels
+  // don't affect the destination, so corners should still show background
+  const QList<QPainter::CompositionMode> blendModes = {
+    QPainter::CompositionMode_Multiply,
+    QPainter::CompositionMode_Screen,
+    QPainter::CompositionMode_Overlay,
+    QPainter::CompositionMode_Difference
+  };
+
+  for ( QPainter::CompositionMode mode : blendModes )
+  {
+    rasterLayer->setBlendMode( mode );
+
+    QgsMapRendererSequentialJob job( settings );
+    job.start();
+    job.waitForFinished();
+    const QImage img = job.renderedImage();
+
+    QVERIFY( !img.isNull() );
+    QCOMPARE( img.size(), QSize( 162, 150 ) );
+
+    // KEY TEST: Transparent region should still show background color
+    // This is the fix for #55628 - without the fix, transparent pixels would
+    // incorrectly blend with the destination and produce wrong colors
+    const QColor corner = img.pixelColor( 5, 5 );
+    QVERIFY2( corner.red() >= 250 && corner.green() <= 5 && corner.blue() <= 5, qPrintable( u"Corner should show red background for blend mode %1, got RGB(%2,%3,%4)"_s.arg( static_cast<int>( mode ) ).arg( corner.red() ).arg( corner.green() ).arg( corner.blue() ) ) );
+
+    // Also verify center (opaque region) still renders properly
+    const QColor center = img.pixelColor( 80, 75 );
+    QVERIFY2( center.alpha() > 0 && ( center.red() > 0 || center.green() > 0 || center.blue() > 0 ), qPrintable( u"Center pixel should be rendered for blend mode %1"_s.arg( static_cast<int>( mode ) ) ) );
+  }
+
+  rasterLayer->setBlendMode( QPainter::CompositionMode_SourceOver );
 }
 
 QGSTEST_MAIN( TestQgsBlendModes )

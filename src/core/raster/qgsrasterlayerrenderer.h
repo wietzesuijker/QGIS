@@ -102,6 +102,9 @@ class CORE_EXPORT QgsRasterLayerRenderer : public QgsMapLayerRenderer
     bool mEnableProfile = false;
     quint64 mPreparationTime = 0;
 
+    //! Whether to force raster render due to non-standard blend mode
+    bool mForceRasterRenderForBlendMode = false;
+
     // may be NULLPTR. no need to delete: if exists it is owned by labeling engine
     QgsRasterLayerLabelProvider *mLabelProvider = nullptr;
 

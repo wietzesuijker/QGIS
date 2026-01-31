@@ -344,10 +344,31 @@ void QgsMapRendererCustomPainterJob::doRender()
 
     if ( ! hasSecondPass && job.img )
     {
-      // If we flattened this layer for alternate blend modes, composite it now
+      // Composite layer image to destination
+      // For non-SourceOver blend modes, we must work around Qt bug QTBUG-66590
+      // where transparent pixels incorrectly affect the destination
+      QImage *destImage = nullptr;
+      QImage destBackup;
+
+      const bool needsTransparencyFix = ( job.blendMode != QPainter::CompositionMode_SourceOver );
+      if ( needsTransparencyFix )
+      {
+        destImage = dynamic_cast<QImage *>( mPainter->device() );
+        if ( destImage )
+          destBackup = destImage->copy();
+      }
+
+      // Draw layer image using existing painter (can't use QgsPainting::drawImageWithBlendMode
+      // here because mPainter is already active on the destination)
       mPainter->setOpacity( job.opacity );
       mPainter->drawImage( 0, 0, *job.img );
       mPainter->setOpacity( 1.0 );
+
+      // Undo damage from Qt bug: restore destination where source was transparent
+      if ( destImage && !destBackup.isNull() )
+      {
+        QgsPainting::restorePixelsWhereTransparent( *destImage, destBackup, *job.img );
+      }
     }
 
     if ( mainElevationMap && job.context()->elevationMap() )

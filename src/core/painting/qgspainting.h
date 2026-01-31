@@ -139,6 +139,39 @@ class CORE_EXPORT QgsPainting
      * \since QGIS 3.40
      */
     static void drawPicture( QPainter *painter, const QPointF &point, const QPicture &picture );
+
+    /**
+     * Draws a \a source image onto \a dest with the specified blend \a mode and \a opacity,
+     * correctly handling transparent pixels.
+     *
+     * Qt's non-SourceOver composition modes (Multiply, Screen, Overlay, etc.) have
+     * a known issue where fully transparent pixels in the source incorrectly affect
+     * the destination (QTBUG-66590). For example, with Multiply mode, transparent
+     * black pixels (0,0,0,0) multiply the destination to black instead of being invisible.
+     *
+     * This function works around the issue by restoring destination pixels wherever
+     * the source alpha is zero.
+     *
+     * \note Not available in Python bindings
+     * \since QGIS 3.44
+     */
+    static void drawImageWithBlendMode( QImage &dest, const QImage &source,
+                                        QPainter::CompositionMode mode, qreal opacity ) SIP_SKIP;
+
+    /**
+     * Restores \a dest pixels from \a backup wherever \a source has alpha = 0.
+     *
+     * This is the low-level workaround for Qt bug QTBUG-66590, where non-SourceOver
+     * blend modes incorrectly modify the destination even for fully transparent
+     * source pixels. Call this after blending to undo unwanted modifications.
+     *
+     * All three images must have the same dimensions and 32-bit ARGB format.
+     *
+     * \note Not available in Python bindings
+     * \since QGIS 3.44
+     */
+    static void restorePixelsWhereTransparent( QImage &dest, const QImage &backup,
+        const QImage &source ) SIP_SKIP;
 };
 
 #endif // QGSPAINTING_H

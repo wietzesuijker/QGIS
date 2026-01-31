@@ -1369,8 +1369,6 @@ QImage QgsMapRendererJob::composeImage( const QgsMapSettings &settings,
   if ( mapShadingRenderer.isActive() )
     mainElevationMap = std::make_unique<QgsElevationMap>( settings.deviceOutputSize(), settings.devicePixelRatio() );
 
-  QPainter painter( &image );
-
 #if DEBUG_RENDERING
   int i = 0;
 #endif
@@ -1383,9 +1381,6 @@ QImage QgsMapRendererJob::composeImage( const QgsMapSettings &settings,
     if ( img.isNull() )
       continue; // image is not prepared and not even in cache
 
-    painter.setCompositionMode( job.blendMode );
-    painter.setOpacity( job.opacity );
-
     if ( mainElevationMap )
     {
       QgsElevationMap layerElevationMap = layerElevationToBeComposed( settings, job, cache );
@@ -1393,14 +1388,17 @@ QImage QgsMapRendererJob::composeImage( const QgsMapSettings &settings,
         mainElevationMap->combine( layerElevationMap, mapShadingRenderer.combinedElevationMethod() );
     }
 
-
 #if DEBUG_RENDERING
     img.save( QString( "/tmp/final_%1.png" ).arg( i ) );
     i++;
 #endif
 
-    painter.drawImage( 0, 0, img );
+    // Use helper to handle Qt bug where transparent pixels affect blended result
+    // with non-SourceOver blend modes (QTBUG-66590)
+    QgsPainting::drawImageWithBlendMode( image, img, job.blendMode, job.opacity );
   }
+
+  QPainter painter( &image );
 
   if ( mapShadingRenderer.isActive() &&  mainElevationMap )
   {
@@ -1433,6 +1431,8 @@ QImage QgsMapRendererJob::composeImage( const QgsMapSettings &settings,
     painter.drawImage( 0, 0, labelCacheImage );
   }
 
+  painter.end();
+
   // render any layers with the renderAboveLabels flag now
   for ( const LayerRenderJob &job : jobs )
   {
@@ -1443,13 +1443,10 @@ QImage QgsMapRendererJob::composeImage( const QgsMapSettings &settings,
     if ( img.isNull() )
       continue; // image is not prepared and not even in cache
 
-    painter.setCompositionMode( job.blendMode );
-    painter.setOpacity( job.opacity );
-
-    painter.drawImage( 0, 0, img );
+    // Use helper to handle Qt bug where transparent pixels affect blended result
+    // with non-SourceOver blend modes (QTBUG-66590)
+    QgsPainting::drawImageWithBlendMode( image, img, job.blendMode, job.opacity );
   }
-
-  painter.end();
 #if DEBUG_RENDERING
   image.save( "/tmp/final.png" );
 #endif
